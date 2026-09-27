@@ -21,7 +21,9 @@
 // FirmwareMessage.version from the opener); a peer that sees a higher version
 // than it speaks should proceed with its known subset (and may warn). Bump
 // PROTOCOL_VERSION only for a BREAKING change, and branch on the peer's version
-// at that point; additive changes never bump it.
+// at that point; additive changes never bump it. web.esphome.io deploys on its
+// own, so every dashboard version must keep working against every receiver in
+// both directions; that is what the optional fields' absent-means-v1 defaults are for.
 
 export const PROTOCOL_VERSION = 1;
 
@@ -30,6 +32,8 @@ export const PROTOCOL_VERSION = 1;
 export interface ReadyMessage {
   type: "esphome-web-flash:ready";
   version: number;
+  // Flasher ids this receiver has; absent (older receivers) means ['esp'].
+  flashers?: HandoffFlasher[];
   // Whether the flasher's browser can actually flash (Web Serial present).
   // The flasher runs on a secure origin, so it can feature-detect for real,
   // unlike a dashboard on plain http. Additive (v1): older flashers omit it,
@@ -58,8 +62,24 @@ export interface FirmwareMessage {
   // which device they're for.
   deviceName?: string;
   erase?: boolean;
+  // Which flasher writes the parts. Additive (v1): absent means esptool, so
+  // an older dashboard's frame is unchanged. An older receiver ignores the
+  // field and would write anything as ESP parts, so an opener sends a
+  // non-esp id only to a receiver whose ReadyMessage.flashers lists it; that
+  // ready-frame gate is the only guard on the receivers already deployed.
+  // A receiver refuses a frame whose flasher it did not list, and the id may
+  // be one a newer opener knows and the receiver does not.
+  // For 'rtl-ambz2' the parts are the LibreTiny UF2 as one part at address
+  // 0, which the receiver parses into flash runs itself.
+  flasher?: HandoffFlasher;
   parts: FlashPart[];
 }
+
+// The flasher a hand-off is for, by an id both apps share: 'esp' is esptool
+// (ESP32 / ESP8266), 'rtl-ambz2' the RTL8720C ROM downloader. Named after the
+// flasher, not the platform: rtl87xx covers the RTL8710B too, whose ROM speaks
+// another protocol and gets its own id when it lands.
+export type HandoffFlasher = "esp" | "rtl-ambz2";
 
 export type FlashState =
   | "connecting"
@@ -73,6 +93,11 @@ export interface StateMessage {
   type: "esphome-web-flash:state";
   state: FlashState;
   detail?: string;
+  // What the user has to do by hand at this point (strap the board into
+  // download mode, reset it after the write); the opener shows it in place
+  // of its own line. Additive (v1): older flashers omit it and older openers
+  // ignore it.
+  note?: string;
 }
 
 export interface ProgressMessage {

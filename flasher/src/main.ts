@@ -3,6 +3,7 @@ import { validateEspImage } from "./image-magic";
 import { hardResetChip } from "./reset";
 import type {
   FirmwareMessage,
+  HandoffFlasher,
   OutboundMessage,
   FlashState,
 } from "./protocol";
@@ -25,6 +26,8 @@ const opener = window.opener as Window | null;
 // start as defense in depth.
 let targetOrigin = params.get("origin") || "*";
 
+// Flashers this page has; advertised in ready.
+const FLASHERS: HandoffFlasher[] = ["esp"];
 let firmware: FirmwareMessage | null = null;
 let busy = false;
 let flashDone = false;
@@ -181,18 +184,26 @@ window.addEventListener("message", (ev: MessageEvent) => {
   const data = ev.data as Partial<FirmwareMessage> | undefined;
   if (!data || data.type !== "esphome-web-flash:firmware") return;
   if (data.nonce !== nonce) return;
+  // The opener has attached and sent: stop re-announcing ready, whether or
+  // not the frame turns out usable.
+  stopReadyRetry();
   if (!isFlashParts(data.parts)) {
-    // The opener has attached and sent, so stop re-announcing ready even though
-    // the payload is unusable, mirroring the accepted path below.
-    stopReadyRetry();
     setState("error", "Received a malformed firmware payload.");
+    return;
+  }
+  // The opener should have declined on our ready frame; refuse rather than
+  // fail the image as a bad ESP one. The id is untrusted and may be one a
+  // newer dashboard knows and this page does not.
+  // Only an absent field means esptool; null or anything else fails closed.
+  const flasher: unknown = data.flasher === undefined ? "esp" : data.flasher;
+  if (!(FLASHERS as unknown[]).includes(flasher)) {
+    setState("error", `This flasher cannot install this firmware (${String(flasher)}).`);
     return;
   }
   // The opener origin is now known; stop broadcasting and pin to it.
   if (targetOrigin === "*" && ev.origin && ev.origin !== "null") {
     targetOrigin = ev.origin;
   }
-  stopReadyRetry();
   firmware = data as FirmwareMessage;
   installBtn.disabled = busy;
   setState(
@@ -214,13 +225,14 @@ function stopReadyRetry(): void {
 }
 
 function sendReady(): void {
-  // Advertise whether this browser can actually flash so the opener can decline
-  // the handoff up front (see ReadyMessage.webSerial in protocol.ts). Same check
-  // that gates the install button below.
+  // Advertise whether this browser can actually flash, and which flashers it
+  // has, so the opener can decline the handoff up front (see ReadyMessage in
+  // protocol.ts). Same Web Serial check that gates the install button below.
   post({
     type: "esphome-web-flash:ready",
     version: PROTOCOL_VERSION,
     webSerial: "serial" in navigator,
+    flashers: FLASHERS,
   });
 }
 
