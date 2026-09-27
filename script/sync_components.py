@@ -114,6 +114,7 @@ _USER_AGENT = "esphome-device-builder-backend (https://github.com/esphome/device
 # ``controllers/components.py`` for the rationale (issue #325).
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _board_mcus import board_mcus  # noqa: E402
 from _catalog_split import (  # noqa: E402
     emit_body_with_roundtrip,
     prepare_next_bodies_dir,
@@ -4538,6 +4539,8 @@ def _emit_platform_capabilities_index() -> None:
         "esp32_board_variants": {
             board: info[KEY_VARIANT] for board, info in sorted(ESP32_BOARDS.items())
         },
+        # The dashboard resolves a device's chip from its YAML ``board:``.
+        "board_mcus": board_mcus(),
         "libretiny_families": list(_libretiny_families()),
         "logger_interface_defaults": logger_defaults,
         "logger_interface_values": logger_values,

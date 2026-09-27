@@ -41,6 +41,7 @@ from esphome_device_builder.helpers.device_yaml import (
     parse_esphome_meta,
     parse_platform_from_yaml,
     pending_changes_via_hash,
+    resolve_chip_mcu,
 )
 from esphome_device_builder.helpers.device_yaml._loading import _snapshot_source_files
 from esphome_device_builder.helpers.device_yaml._parsing import (
@@ -1093,6 +1094,89 @@ def test_extract_logger_interface_board_snapshot_fallback() -> None:
 def test_extract_logger_interface_none(config: Any, platform: str) -> None:
     """Unknowable interfaces (no logger, libretiny, unknown variant) yield ``None``."""
     assert extract_logger_interface(config, platform) is None
+
+
+@pytest.mark.parametrize(
+    ("config", "platform", "expected"),
+    [
+        # The board names the chip, through ESPHome's own tables.
+        ({"rtl87xx": {"board": "bw15"}}, "rtl87xx", "rtl8720c"),
+        ({"rtl87xx": {"board": "wr2"}}, "rtl87xx", "rtl8710b"),
+        ({"rp2": {"board": "rpipicow"}}, "rp2", "rp2040"),
+        ({"rp2": {"board": "rpipico2w"}}, "rp2", "rp2350"),
+        ({"bk72xx": {"board": "cb3s"}}, "bk72xx", "bk7231"),
+        # The pre-rename platform key and alias still resolve.
+        ({"rp2040": {"board": "rpipico2w"}}, "rp2040", "rp2350"),
+        # A board ESPHome does not list carries its chip itself.
+        ({"rtl87xx": {"board": "custom", "family": "RTL8720C"}}, "rtl87xx", "rtl8720c"),
+        ({"bk72xx": {"board": "custom", "family": "bk7231n"}}, "bk72xx", "bk7231"),
+        ({"rp2": {"variant": "RP2350"}}, "rp2", "rp2350"),
+        # The board wins over a family that ESPHome would reject anyway.
+        ({"rtl87xx": {"board": "bw15", "family": "RTL8710B"}}, "rtl87xx", "rtl8720c"),
+        # A platform with one chip needs no board.
+        ({"ln882x": {"board": "custom"}}, "ln882x", "ln882h"),
+    ],
+)
+def test_resolve_chip_mcu_resolves(config: dict, platform: str, expected: str) -> None:
+    assert resolve_chip_mcu(config, "", platform) == expected
+
+
+@pytest.mark.parametrize(
+    ("config", "platform"),
+    [
+        # Platforms that need no split.
+        ({"esp32": {"board": "esp32dev"}}, "esp32"),
+        ({"esp8266": {"board": "d1_mini"}}, "esp8266"),
+        ({"nrf52": {"board": "adafruit_itsybitsy_nrf52840"}}, "nrf52"),
+        # The chip is not named: never guess one of several.
+        ({"rtl87xx": {"board": "custom"}}, "rtl87xx"),
+        ({"rtl87xx": {}}, "rtl87xx"),
+        ({"rp2": {"board": "custom"}}, "rp2"),
+        ({"rp2": {"variant": "RP9999"}}, "rp2"),
+        ({"rtl87xx": {"board": "${unset}"}}, "rtl87xx"),
+        ({"rtl87xx": {"board": 7}}, "rtl87xx"),
+        # A family or variant that is not one of the platform's chips.
+        ({"rtl87xx": {"board": "custom", "family": "BK7231N"}}, "rtl87xx"),
+        ({"rtl87xx": {"board": "custom", "family": "garbage"}}, "rtl87xx"),
+        ({"rp2": {"board": "custom", "family": "rp2350"}}, "rp2"),
+        (None, ""),
+    ],
+)
+def test_resolve_chip_mcu_none(config: Any, platform: str) -> None:
+    assert resolve_chip_mcu(config, "", platform) is None
+
+
+def test_resolve_chip_mcu_resolves_substitutions() -> None:
+    subs = {"the_board": "bw15", "chip": "RP2350"}
+    assert resolve_chip_mcu({"rtl87xx": {"board": "${the_board}"}}, "", "rtl87xx", subs) == (
+        "rtl8720c"
+    )
+    assert resolve_chip_mcu({"rp2": {"variant": "$chip"}}, "", "rp2", subs) == "rp2350"
+
+
+def test_resolve_chip_mcu_reads_the_raw_text_without_a_resolved_config() -> None:
+    """A shallow scan has no resolved config; the raw text carries the same fields."""
+    assert resolve_chip_mcu(None, "rtl87xx:\n  board: bw15\n", "rtl87xx") == "rtl8720c"
+    assert resolve_chip_mcu(None, "rp2040:\n  variant: RP2350\n", "rp2") == "rp2350"
+    raw = "rtl87xx:\n  board: custom\n  family: RTL8720C\n"
+    assert resolve_chip_mcu(None, raw, "rtl87xx") == "rtl8720c"
+    # A trailing comment is not part of the value, as a full load reads it.
+    raw = "rtl87xx:\n  board: bw15  # kitchen plug\n"
+    assert resolve_chip_mcu(None, raw, "rtl87xx") == "rtl8720c"
+    raw = "rtl87xx:\n  board: custom\n  family: 'RTL8720C' # custom module\n"
+    assert resolve_chip_mcu(None, raw, "rtl87xx") == "rtl8720c"
+    # The same answer as a full load gives for a substituted board.
+    raw = "rtl87xx:\n  board: ${the_board}\n"
+    assert resolve_chip_mcu(None, raw, "rtl87xx", {"the_board": "bw15"}) == "rtl8720c"
+    # The text names another platform than the device's: nothing to read.
+    assert resolve_chip_mcu(None, "esp32:\n  board: bw15\n", "rtl87xx") is None
+
+
+def test_load_device_from_storage_resolves_mcu(tmp_path: Path) -> None:
+    bw15 = tmp_path / "bw15.yaml"
+    bw15.write_text("esphome:\n  name: bw15\nrtl87xx:\n  board: bw15\n", encoding="utf-8")
+    assert load_device_from_storage(bw15).mcu == "rtl8720c"
+    assert load_device_from_storage(bw15, shallow=True).mcu == "rtl8720c"
 
 
 def test_load_device_from_storage_resolves_logger_interface(tmp_path: Path) -> None:

@@ -61,6 +61,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _board_mcus import board_mcus, catalog_board_mcu  # noqa: E402
 from _catalog_split import (  # noqa: E402
     dumps_envelope_entries_per_line,
     dumps_map_entry_per_line,
@@ -122,22 +123,6 @@ _LIBRETINY_FAMILIES: dict[str, tuple[str, str]] = {
     "bk72xx": ("BK72XX_BOARDS", "BK72XX_BOARD_PINS"),
     "rtl87xx": ("RTL87XX_BOARDS", "RTL87XX_BOARD_PINS"),
     "ln882x": ("LN882X_BOARDS", "LN882X_BOARD_PINS"),
-}
-
-# ESPHome LibreTiny board meta carries ``family`` (the chip). Fold it into the
-# picker's per-chip series token (``mcu``): BK7231N/T/Q share one ``bk7231``
-# filter, the rest map 1:1. An unmapped future family falls back to its own
-# lowercased token in _backfill_libretiny_mcu, so a new chip still gets a
-# distinct section (only a frontend chip line is then needed).
-_LIBRETINY_MCU: dict[str, str] = {
-    "BK7231N": "bk7231",
-    "BK7231T": "bk7231",
-    "BK7231Q": "bk7231",
-    "BK7238": "bk7238",
-    "BK7251": "bk7251",
-    "RTL8710B": "rtl8710b",
-    "RTL8720C": "rtl8720c",
-    "LN882H": "ln882h",
 }
 
 # Per-platform documentation page for generated boards (those no manifest
@@ -471,48 +456,20 @@ def _backfill_rp2040_wifi(boards: list[BoardCatalogEntry]) -> None:
                 board.tags.append(BoardTag.WIFI)
 
 
-def _backfill_rp2040_mcu(boards: list[BoardCatalogEntry]) -> None:
+def _backfill_mcu(boards: list[BoardCatalogEntry]) -> None:
     """
-    Set each rp2040 board's chip series ("rp2040" / "rp2350") from ESPHome.
+    Set each board's chip series (``mcu``) on the platforms that lump several.
 
-    ESPHome lumps both chips under the rp2040 platform; ``mcu`` is the only
-    structured discriminator, letting the picker split the filter and badge the
-    real chip. Covers curated and generated boards alike; a backfill (not part of
-    generation) so the manifest-only drift test applies it the same way.
+    rp2 is both the rp2040 and the rp2350, and bk72xx/rtl87xx/ln882x each
+    cover several chips; ``mcu`` is the picker's per-chip discriminator
+    (BK7231N/T/Q fold to ``bk7231``). Covers curated and generated boards; a
+    backfill so the manifest-only drift test applies it the same way.
     """
-    module = importlib.import_module("esphome.components.rp2.boards")
+    table = board_mcus()
     for board in boards:
-        if board.esphome.platform is Platform.RP2:
-            meta = module.BOARDS.get(board.esphome.board)
-            board.esphome.mcu = meta.get("mcu", "rp2040") if isinstance(meta, dict) else "rp2040"
-
-
-def _backfill_libretiny_mcu(boards: list[BoardCatalogEntry]) -> None:
-    """
-    Set each LibreTiny board's chip series (``mcu``) from ESPHome's family.
-
-    bk72xx/rtl87xx/ln882x each lump several chips under one platform; ``mcu`` is
-    the picker's per-chip discriminator (BK7231N/T/Q fold to ``bk7231``). Covers
-    curated and generated boards; a backfill so the manifest-only drift test
-    applies it the same way. A board ESPHome doesn't list falls back to the
-    platform's sole token (ln882x -> ``ln882h``) or stays unset.
-    """
-    for platform, (boards_attr, _pins_attr) in _LIBRETINY_FAMILIES.items():
-        module = importlib.import_module(f"esphome.components.{platform}.boards")
-        board_list: dict[str, Any] = getattr(module, boards_attr)
-        family_by_board = {board: meta.get("family") for board, meta in board_list.items()}
-        tokens = {_LIBRETINY_MCU[f] for f in family_by_board.values() if f in _LIBRETINY_MCU}
-        sole_token = next(iter(tokens)) if len(tokens) == 1 else None
-        for board in boards:
-            if board.esphome.platform.value != platform:
-                continue
-            family = family_by_board.get(board.esphome.board)
-            if family in _LIBRETINY_MCU:
-                board.esphome.mcu = _LIBRETINY_MCU[family]
-            elif family:
-                board.esphome.mcu = re.sub(r"[^a-z0-9]", "", family.lower())
-            elif sole_token:
-                board.esphome.mcu = sole_token
+        mcu = catalog_board_mcu(table, board.esphome.platform.value, board.esphome.board)
+        if mcu is not None:
+            board.esphome.mcu = mcu
 
 
 # SPI ethernet pin field -> the occupied_by label shown on the overlaid pin.
@@ -1260,8 +1217,7 @@ def build_catalog() -> BoardCatalogResponse:
     _augment_libretiny_boards(catalog.boards)
     _augment_rp2040_boards(catalog.boards)
     _backfill_rp2040_wifi(catalog.boards)
-    _backfill_rp2040_mcu(catalog.boards)
-    _backfill_libretiny_mcu(catalog.boards)
+    _backfill_mcu(catalog.boards)
     _augment_rp2040_onboard_ethernet_pins(catalog.boards)
     _augment_esp32_boards(catalog.boards)
     _backfill_esp32_engineering_sample(catalog.boards)

@@ -24,6 +24,7 @@ from ..mac_addresses import derive_interface_macs
 from ..migrations import has_pending_migrations
 from ..storage_path import resolve_storage_path
 from ..validated_config_cache import find_validated_cache, parse_validated_cache
+from ._chip import resolve_chip_mcu
 from ._mqtt_block import build_mqtt_extract
 from ._parsing import (
     _CONF_ALLOW_PARTITION_ACCESS,
@@ -270,6 +271,8 @@ def load_device_from_storage(
         storage_variant=storage.target_platform if storage else None,
     )
 
+    mcu = resolve_chip_mcu(resolved_config, yaml_content, target_platform, extra_subs)
+
     loaded_integrations = sorted(storage.loaded_integrations) if storage else []
     loaded_platforms = dotted_loaded_platforms(storage.loaded_platforms) if storage else []
     # Subset of loaded_integrations the user directly wrote — top-
@@ -388,6 +391,7 @@ def load_device_from_storage(
         labels=list(labels),
         logger_baud_rate=logger_baud_rate,
         logger_interface=logger_interface,
+        mcu=mcu,
         # Gates the install dialog's OTA bootloader-update action; esp32-only
         # (the esphome schema rejects the flag elsewhere). Union of two
         # signals: the in-process resolved YAML (immediate on edit) and the
