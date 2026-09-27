@@ -338,6 +338,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         await self._scanner.stop()
         await self._mqtt_coordinator.stop()
         await self._state_monitor.stop()
+        state_callbacks.record_last_seen_on_stop(self)
         await drain_shutdown_callbacks(self._shutdown_callbacks)
 
     async def poll(self) -> None:
@@ -1253,6 +1254,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         return reachability.build_snapshot(self, name)
 
     def _on_reachability_observation(self, name: str) -> None:
+        state_callbacks.record_last_seen(self, name)
         reachability.on_observation(self, name)
 
     def get_reachability_snapshot(self, name: str) -> DeviceReachabilityData | None:

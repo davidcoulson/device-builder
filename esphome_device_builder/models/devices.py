@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from typing import Any, Literal, NamedTuple, TypedDict
 
 from .common import DashboardModel
+
+
+def offline_seconds(offline_since: float | None) -> float | None:
+    """Return the age of an ``offline_since`` stamp, the form a client is sent."""
+    return None if offline_since is None else max(0.0, time.time() - offline_since)
 
 
 class DeviceState(StrEnum):
@@ -80,6 +86,10 @@ class DeviceRuntimeState(DashboardModel):
     # just the one address they know. ``Device.ip`` always holds the
     # primary picked for OTA cache args.
     ip_addresses: list[str] = field(default_factory=list)
+    # Epoch seconds at which the device stopped being reachable, or ``None``
+    # while it is online or nothing is known. Survives a restart. Never sent:
+    # the wire carries ``offline_seconds``, its age at serialization.
+    offline_since: float | None = None
     deployed_version: str = ""
     # 8-char hex hash of the running firmware, read from the mDNS
     # ``config_hash`` TXT record (esphome/esphome#16145). When this
@@ -103,6 +113,11 @@ class DeviceRuntimeState(DashboardModel):
     # evidence for the sidecar-seeded values, which is exactly what the
     # flag reports.
     deployed_identity_live: bool = False
+
+    def __post_serialize__(self, d: dict[Any, Any]) -> dict[Any, Any]:
+        """Replace the ``offline_since`` stamp with its age."""
+        d["offline_seconds"] = offline_seconds(d.pop("offline_since"))
+        return d
 
 
 # Canonical name set for routing flat attr names onto ``runtime_state``.
@@ -508,6 +523,8 @@ class DeviceStateChangedData(TypedDict):
 
     configuration: str
     state: str
+    # Mirrors the wire's ``runtime_state.offline_seconds``.
+    offline_seconds: float | None
 
 
 class DeviceReachabilityData(TypedDict):
