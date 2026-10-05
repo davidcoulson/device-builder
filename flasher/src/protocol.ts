@@ -76,8 +76,35 @@ export interface FirmwareMessage {
   // Where the device's serial logs are, when the opener knows; absent means
   // elsewhere or unknown.
   logs?: HandoffLogs;
+  // The baud the device logs at, when the opener knows it; absent means
+  // ESPHome's default. An older receiver ignores it and opens the logs at
+  // the default.
+  logBaudRate?: number;
   parts: FlashPart[];
 }
+
+// ESPHome's default UART log baud.
+export const LOG_BAUD_RATE = 115200;
+
+// Plausible UART rates; anything else in the untrusted frame is ignored.
+const MIN_LOG_BAUD_RATE = 300;
+const MAX_LOG_BAUD_RATE = 4_000_000;
+
+// The inbound 'logBaudRate' field, or undefined for anything that is not a
+// plausible baud.
+export const handoffLogBaudRateOf = (value: unknown): number | undefined =>
+  typeof value === "number" &&
+  Number.isInteger(value) &&
+  value >= MIN_LOG_BAUD_RATE &&
+  value <= MAX_LOG_BAUD_RATE
+    ? value
+    : undefined;
+
+// The baud to read a handed-off device's logs at, or null when it has none.
+// 'logBaudRate' is the one already checked when the frame arrived.
+export const handoffLogBaud = (
+  firmware: Pick<FirmwareMessage, "logs" | "logBaudRate">,
+): number | null => (firmware.logs === "off" ? null : (firmware.logBaudRate ?? LOG_BAUD_RATE));
 
 // 'flash-port': on the port the flash goes over; 'off': the device has none.
 export type HandoffLogs = "flash-port" | "off";
