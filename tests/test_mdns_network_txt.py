@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
+from esphome_device_builder.controllers._device_state_monitor import DeviceStateMonitor
 from esphome_device_builder.models import EventType
 
 from .conftest import (
@@ -70,3 +73,12 @@ def test_network_only_http_txt_does_not_vouch_for_identity() -> None:
     assert devices[0].runtime_state.network == "wifi"
     assert devices[0].runtime_state.deployed_identity_live is False
     assert callbacks.calls_for("on_deployed_identity_live_change") == []
+
+
+def test_unwired_callback_drops_the_observation() -> None:
+    """A monitor without ``on_network_change`` forwards nothing."""
+    monitor = DeviceStateMonitor(
+        get_devices=lambda: [make_device()], on_state_change=MagicMock(), on_ip_change=MagicMock()
+    )
+
+    assert monitor._apply_network("kitchen", "wifi") is False
