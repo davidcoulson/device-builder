@@ -100,9 +100,7 @@ ApiEncryptionChangeCallback = Callable[[str, str], None]
 # firmware without the broadcast doesn't blank a known MAC.
 MacAddressChangeCallback = Callable[[str, str], None]
 
-# mDNS ``network`` TXT change — ``"wifi"`` / ``"ethernet"``, the link
-# the announce arrived over. Descriptive only: it never vouches for
-# identity freshness. Absent on pre-2023.6 firmware.
+# mDNS ``network`` TXT change (``"wifi"`` / ``"ethernet"``).
 NetworkChangeCallback = Callable[[str, str], None]
 
 

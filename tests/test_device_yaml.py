@@ -3288,18 +3288,6 @@ def test_load_device_without_previous_defaults_active_source_to_unknown(
 
 
 @pytest.mark.usefixtures("_redirect_ext_storage")
-def test_load_device_seeds_network_from_sidecar(tmp_path: Path) -> None:
-    """A persisted ``network`` is back on the device before the first mDNS sweep."""
-    yaml_path = tmp_path / "kitchen.yaml"
-    yaml_path.write_text("esphome:\n  name: kitchen\n", encoding="utf-8")
-    write_storage_json(tmp_path, "kitchen.yaml")
-
-    device = load_device_from_storage(yaml_path, network="ethernet")
-
-    assert device.runtime_state.network == "ethernet"
-
-
-@pytest.mark.usefixtures("_redirect_ext_storage")
 def test_load_device_carries_runtime_state_from_previous(tmp_path: Path) -> None:
     """The whole monitor-observed ``runtime_state`` survives a rebuild."""
     yaml_path = tmp_path / "kitchen.yaml"

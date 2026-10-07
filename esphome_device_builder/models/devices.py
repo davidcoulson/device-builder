@@ -98,9 +98,7 @@ class DeviceRuntimeState(DashboardModel):
     # how we tell "flashed with the latest compile" apart from
     # "compile succeeded but device still runs older firmware".
     deployed_config_hash: str = ""
-    # Link the device announced over, from the ``network`` TXT
-    # (``"wifi"`` / ``"ethernet"``); a board with both blocks only
-    # settles it at runtime. Empty until an announce carries the key.
+    # Link from the ``network`` TXT (``"wifi"`` / ``"ethernet"``); empty until announced.
     network: str = ""
     # True once a local offline compile finished successfully and is
     # waiting to be flashed via OTA upon the next mDNS check-in.
