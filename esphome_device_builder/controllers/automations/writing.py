@@ -29,6 +29,7 @@ from ...helpers.yaml import (
     remove_inline_handler,
     remove_nested_handler,
     remove_subentity_handler,
+    splice_lines,
     upsert_inline_handler,
     upsert_nested_handler,
     upsert_subentity_handler,
@@ -66,17 +67,22 @@ from .emitter import (
 from .parsing import (
     ComponentTarget,
     component_action_field_paths,
+    declares_id,
+    instance_id,
+    is_mapping_entry,
     make_yaml,
     resolve_action_field_target,
     resolve_component_domain,
     resolve_component_target,
 )
+from .writing_blocks import in_list_form
 from .writing_lists import (
     ListContainerStrategy,
     delete_light_effect,
     delete_list_entry,
     delete_list_entry_for,
     delete_subentity_list_entry,
+    require_replaceable,
     upsert_component_on_entry,
     upsert_light_effect,
     upsert_list_entry,
@@ -152,7 +158,7 @@ def _upsert_script(
 ) -> tuple[str, YamlDiff]:
     """Splice or replace a top-level ``script:`` list item."""
     rendered = render_script_item(tree, location.id)
-    return _upsert_top_level_list(yaml_text, "script", rendered, location.id, "id")
+    return _upsert_top_level_list(yaml_text, "script", rendered, location.id)
 
 
 def _upsert_interval(
@@ -223,6 +229,7 @@ def _upsert_device_on_entry(
         index=index,
         strategy=_DEVICE_STRATEGY,
         trigger=catalog.trigger_by_id(trigger),
+        replaceable=is_mapping_entry,
     )
 
 
@@ -274,12 +281,7 @@ def _upsert_component_on(
             f"under {instance_domain!r}; can't splice handler {location.trigger!r}"
         )
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
-    new_text, from_line, to_line, replacement = res
-    return new_text, YamlDiff(
-        fromLine=from_line,
-        toLine=to_line,
-        replacement=replacement,
-    )
+    return res
 
 
 def _upsert_subentity_on(
@@ -314,8 +316,7 @@ def _upsert_subentity_on(
             f"{ref.parent_domain!r}; can't splice handler {location.trigger!r}"
         )
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
-    new_text, from_line, to_line, replacement = res
-    return new_text, YamlDiff(fromLine=from_line, toLine=to_line, replacement=replacement)
+    return res
 
 
 _FIELD_SEGMENT_RE = re.compile(r"^[a-z0-9_]+$")
@@ -390,8 +391,7 @@ def _upsert_component_action(
             f"can't take action field {location.field!r} (instance or list item missing)"
         )
         raise CommandError(ErrorCode.NOT_FOUND, msg)
-    new_text, from_line, to_line, replacement = res
-    return new_text, YamlDiff(fromLine=from_line, toLine=to_line, replacement=replacement)
+    return res
 
 
 def _canonicalized_api_block(
@@ -457,7 +457,9 @@ def _upsert_api_action(
     if existing is not None:
         item_start, item_end = existing
         rendered_text = api_actions.indent_for_list(rendered, item_indent)
-        new_text, diff = api_actions.render_replacement(lines, item_start, item_end, rendered_text)
+        new_text, diff = splice_lines(
+            lines, start=item_start, end=item_end, replacement=rendered_text
+        )
     else:
         new_text, diff = api_actions.render_append(lines, actions_end, item_indent, rendered)
     if block_key == api_actions.BLOCK_KEYS[0]:
@@ -470,40 +472,54 @@ def _upsert_api_action(
 # ---------------------------------------------------------------------------
 
 
+@in_list_form
 def _upsert_top_level_list(
     yaml_text: str,
     domain: str,
     rendered_item: str,
     item_id: str,
-    id_key: str,
 ) -> tuple[str, YamlDiff]:
-    """Insert / replace a list item identified by a string id field."""
-    yaml = make_yaml()
-    data = yaml.load(yaml_text) or {}
-    items = data.get(domain) if isinstance(data, dict) else None
-    existing_idx: int | None = None
-    if isinstance(items, list):
-        for idx, raw in enumerate(items):
-            if isinstance(raw, dict) and str(raw.get(id_key, "")) == item_id:
-                existing_idx = idx
-                break
+    """Insert / replace the list item the parser lists as *item_id*."""
+    existing_idx = _top_level_item_index(yaml_text, domain, item_id)
     if existing_idx is None:
         return _append_top_level_list(yaml_text, domain, rendered_item)
     return _replace_top_level_list_item(yaml_text, domain, existing_idx, rendered_item)
 
 
+def _top_level_item_index(yaml_text: str, domain: str, item_id: str) -> int | None:
+    """Index of the ``<domain>:`` item declaring *item_id*, else the id-less one listed as it."""
+    data = make_yaml().load(yaml_text) or {}
+    items = data.get(domain) if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    entries = [(idx, raw) for idx, raw in enumerate(items) if is_mapping_entry(raw)]
+    for idx, raw in entries:
+        if declares_id(raw) and str(raw["id"]) == item_id:
+            return idx
+    for idx, raw in entries:
+        if instance_id(domain, raw, idx, is_list=True) == item_id:
+            return idx
+    return None
+
+
+@in_list_form
 def _upsert_top_level_list_indexed(
     yaml_text: str,
     domain: str,
     rendered_item: str,
     index: int,
 ) -> tuple[str, YamlDiff]:
-    """Insert (at the end) or replace a list item by positional index."""
+    """Append (``index == len``), replace (in range), or raise (out of range)."""
     yaml = make_yaml()
     data = yaml.load(yaml_text) or {}
     items = data.get(domain) if isinstance(data, dict) else None
-    if isinstance(items, list) and 0 <= index < len(items):
+    entries = items if isinstance(items, list) else []
+    if 0 <= index < len(entries):
+        require_replaceable(entries, index, label=domain, replaceable=is_mapping_entry)
         return _replace_top_level_list_item(yaml_text, domain, index, rendered_item)
+    if index != len(entries):
+        msg = f"{domain}[{index}] out of range (have {len(entries)})"
+        raise CommandError(ErrorCode.INVALID_ARGS, msg)
     return _append_top_level_list(yaml_text, domain, rendered_item)
 
 
@@ -533,13 +549,8 @@ def _replace_top_level_list_item(
     """Replace the *index*'th list item under ``<domain>:`` with rendered_item."""
     lines = yaml_text.splitlines(keepends=True)
     start, end = _locate_top_list_item(lines, domain, index)
-    indented = _indent_for_top_list(rendered_item)
-    new_lines = [*lines[:start], indented, *lines[end:]]
-    new_text = "".join(new_lines)
-    return new_text, YamlDiff(
-        fromLine=start + 1,
-        toLine=end,
-        replacement=indented,
+    return splice_lines(
+        lines, start=start, end=end, replacement=_indent_for_top_list(rendered_item)
     )
 
 
@@ -573,26 +584,14 @@ def _upsert_under_top_key(
             break
     rendered_text = "\n".join(_indent_block(rendered_yaml, indent)) + "\n"
     if handler_start is not None and handler_end is not None:
-        new_lines = [*lines[:handler_start], rendered_text, *lines[handler_end:]]
-        new_text = "".join(new_lines)
-        return new_text, YamlDiff(
-            fromLine=handler_start + 1,
-            toLine=handler_end,
-            replacement=rendered_text,
-        )
+        return splice_lines(lines, start=handler_start, end=handler_end, replacement=rendered_text)
     insert_at = end
     while insert_at > start + 1 and not lines[insert_at - 1].strip():
         insert_at -= 1
-    new_lines = [*lines[:insert_at], rendered_text, *lines[insert_at:]]
-    new_text = "".join(new_lines)
     # Pure-insert convention: ``toLine == fromLine - 1`` encodes
     # "no lines replaced; insert before fromLine". See
     # :class:`YamlDiff`'s docstring.
-    return new_text, YamlDiff(
-        fromLine=insert_at + 1,
-        toLine=insert_at,
-        replacement=rendered_text,
-    )
+    return splice_lines(lines, start=insert_at, end=insert_at, replacement=rendered_text)
 
 
 # ---------------------------------------------------------------------------
@@ -606,12 +605,7 @@ def _delete_top_level(
 ) -> tuple[str, YamlDiff]:
     """Drop a top-level script / interval / device-on block."""
     if isinstance(location, ScriptLocation):
-        return _delete_top_level_list_by_id(
-            yaml_text,
-            "script",
-            "id",
-            location.id,
-        )
+        return _delete_top_level_list_by_id(yaml_text, "script", location.id)
     if isinstance(location, IntervalLocation):
         return _delete_top_level_list_by_index(yaml_text, "interval", location.index)
     if isinstance(location, DeviceOnLocation):
@@ -626,41 +620,34 @@ def _delete_top_level(
     raise CommandError(ErrorCode.INVALID_ARGS, msg)  # pragma: no cover
 
 
+@in_list_form
 def _delete_top_level_list_by_id(
     yaml_text: str,
     domain: str,
-    id_key: str,
     item_id: str,
 ) -> tuple[str, YamlDiff]:
-    """Remove the list item under ``<domain>:`` whose ``id`` matches."""
-    yaml = make_yaml()
-    data = yaml.load(yaml_text) or {}
-    items = data.get(domain) if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        msg = f"Block {domain!r} not present; nothing to delete"
+    """Remove the list item under ``<domain>:`` the parser lists as *item_id*."""
+    idx = _top_level_item_index(yaml_text, domain, item_id)
+    if idx is None:
+        msg = f"{domain}:[id={item_id!r}] not present"
         raise CommandError(ErrorCode.NOT_FOUND, msg)
-    for idx, raw in enumerate(items):
-        if isinstance(raw, dict) and str(raw.get(id_key, "")) == item_id:
-            return _delete_top_level_list_by_index(yaml_text, domain, idx)
-    msg = f"{domain}:[{id_key}={item_id!r}] not present"
-    raise CommandError(ErrorCode.NOT_FOUND, msg)
+    return _delete_list_item_lines(yaml_text, domain, idx)
 
 
+@in_list_form
 def _delete_top_level_list_by_index(
     yaml_text: str,
     domain: str,
     index: int,
 ) -> tuple[str, YamlDiff]:
     """Remove the *index*'th list item under ``<domain>:``."""
+    return _delete_list_item_lines(yaml_text, domain, index)
+
+
+def _delete_list_item_lines(yaml_text: str, domain: str, index: int) -> tuple[str, YamlDiff]:
     lines = yaml_text.splitlines(keepends=True)
     start, end = _locate_top_list_item(lines, domain, index)
-    new_lines = [*lines[:start], *lines[end:]]
-    new_text = "".join(new_lines)
-    return new_text, YamlDiff(
-        fromLine=start + 1,
-        toLine=end,
-        replacement="",
-    )
+    return splice_lines(lines, start=start, end=end, replacement="")
 
 
 def _delete_under_top_key(
@@ -680,12 +667,7 @@ def _delete_under_top_key(
         text = lines[idx].rstrip("\n\r")
         if text == handler_prefix or text.startswith(handler_prefix + " "):
             handler_end = child_block_end(lines, idx, end, indent)
-            new_lines = [*lines[:idx], *lines[handler_end:]]
-            return "".join(new_lines), YamlDiff(
-                fromLine=idx + 1,
-                toLine=handler_end,
-                replacement="",
-            )
+            return splice_lines(lines, start=idx, end=handler_end, replacement="")
     msg = f"{block_key}.{handler_key} not present"
     raise CommandError(ErrorCode.NOT_FOUND, msg)
 
@@ -719,8 +701,7 @@ def _delete_component_on(
             f"under {instance_domain!r}; can't delete handler {location.trigger!r}"
         )
         raise CommandError(ErrorCode.NOT_FOUND, msg)
-    new_text, from_line, to_line = res
-    return new_text, YamlDiff(fromLine=from_line, toLine=to_line, replacement="")
+    return res
 
 
 def _delete_subentity_on(
@@ -749,8 +730,7 @@ def _delete_subentity_on(
             f"{ref.parent_domain!r}; can't delete handler {location.trigger!r}"
         )
         raise CommandError(ErrorCode.NOT_FOUND, msg)
-    new_text, from_line, to_line = res
-    return new_text, YamlDiff(fromLine=from_line, toLine=to_line, replacement="")
+    return res
 
 
 def _delete_component_action(
@@ -782,8 +762,7 @@ def _delete_component_action(
             f"has no action field {location.field!r}; nothing to delete"
         )
         raise CommandError(ErrorCode.NOT_FOUND, msg)
-    new_text, from_line, to_line, replacement = res
-    return new_text, YamlDiff(fromLine=from_line, toLine=to_line, replacement=replacement)
+    return res
 
 
 def _delete_api_action(
@@ -829,9 +808,9 @@ def _delete_api_action(
     if siblings == 0:
         # Last sibling — drop the entire block key as well so the file
         # doesn't grow ``actions: []`` noise.
-        return api_actions.render_delete_actions_key(lines, actions_start, actions_end)
+        return splice_lines(lines, start=actions_start, end=actions_end, replacement="")
     lines = _canonicalized_api_block(lines, actions_span)
-    new_text, diff = api_actions.render_delete_item(lines, item_start, item_end)
+    new_text, diff = splice_lines(lines, start=item_start, end=item_end, replacement="")
     if block_key == api_actions.BLOCK_KEYS[0]:
         return new_text, diff
     return _widen_diff_to_block(lines, actions_start, actions_end, new_text)

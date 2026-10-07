@@ -10,17 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from esphome.core import CORE
+from esphome.storage_json import ignored_devices_storage_path
 from esphome.zeroconf import AsyncEsphomeZeroconf
 
 from ...constants import SECRETS_FILENAME, is_secrets_file
 from ...helpers.api import CommandError, api_command
 from ...helpers.async_ import create_logged_task, drain_tasks, run_in_executor
 from ...helpers.build_size import BuildSizeRefreshResult
+from ...helpers.device_config import read_device_config, read_device_config_async
 from ...helpers.device_yaml import board_requires_wifi
 from ...helpers.event_bus import Event
 from ...helpers.secrets_state import (
@@ -79,15 +82,14 @@ from . import (
     troubleshoot,
     validate,
 )
+from ._ignored_devices_store import SAVE_DELAY as _IGNORED_DEVICES_SAVE_DELAY
+from ._ignored_devices_store import ignored_devices_store
 from ._metadata_store import DeviceMetadataStore
 from ._pending_keys_store import PendingKeysStore
 from ._shared_sidecar import SharedSidecarClient
 from ._state import DevicesState
 from ._yaml_search_cache import YamlSearchCache
-from .helpers import (
-    _build_address_cache_args,
-    raise_device_not_found,
-)
+from .helpers import _build_address_cache_args, persist_if_unchanged, refuse_empty_write
 from .import_upload import UploadTokens
 from .metadata import DeviceMetadataBase
 
@@ -147,6 +149,9 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         self._pending_keys = PendingKeysStore(
             data_dir=Path(CORE.data_dir),
             shutdown_register=self._shutdown_callbacks.append,
+        )
+        self._ignored_devices_store = ignored_devices_store(
+            ignored_devices_storage_path(), shutdown_register=self._shutdown_callbacks.append
         )
         # Resolved here because ``CORE.data_dir`` stats the config dir;
         # the validate path reads it from the loop thread.
@@ -225,8 +230,6 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
             on_config_hash_change=self._on_config_hash_change,
             on_api_encryption_change=self._on_api_encryption_change,
             on_mac_address_change=self._on_mac_address_change,
-            on_project_name_change=self._on_project_name_change,
-            on_project_version_change=self._on_project_version_change,
             on_network_change=self._on_network_change,
             on_importable_added=self._on_importable_added,
             on_importable_removed=self._on_importable_removed,
@@ -236,6 +239,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
             on_persisted_ip_invalidated=self._on_persisted_ip_invalidated,
             on_resolved_addresses_cleared=self._on_resolved_addresses_cleared,
             on_deployed_identity_live_change=self._on_deployed_identity_live_change,
+            on_ota_signed_change=self._on_ota_signed_change,
         )
         # Per-signal freshness tracker (mDNS / ping / MQTT last-seen,
         # ping RTT) feeding the device drawer's Reachability section.
@@ -289,7 +293,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
             group.create_task(self._metadata_store.async_load())
             group.create_task(self._pending_keys.async_load())
             group.create_task(self.migrate_board_id_user_set())
-            group.create_task(run_in_executor(self._load_ignored_devices))
+            group.create_task(self._load_ignored_devices())
         # Shallow seed; the refine task spawned below deep-reloads each
         # device off the startup critical path.
         await self._scanner.scan(shallow=True)
@@ -336,6 +340,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         await self._scanner.stop()
         await self._mqtt_coordinator.stop()
         await self._state_monitor.stop()
+        state_callbacks.record_last_seen_on_stop(self)
         await drain_shutdown_callbacks(self._shutdown_callbacks)
 
     async def poll(self) -> None:
@@ -426,7 +431,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         loaded = device.loaded_integrations
         if loaded and "api" not in loaded and "web_server" not in loaded:
             return []
-        return _build_address_cache_args(device, self._state_monitor)
+        return _build_address_cache_args(device, self._state_monitor, self._deployed_name(device))
 
     def get_ota_address_cache_args(self, configuration: str, port: str | None) -> list[str]:
         """Return cache args when ``port == "OTA"`` (or ``None`` for always-OTA flows)."""
@@ -718,19 +723,17 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         *,
         action: str,
         on_failure: ErrorCode = ErrorCode.INVALID_ARGS,
-        on_error_cleanup: Callable[[], None] | None = None,
         tolerate_unavailable: bool = False,
         timeout: float | None = None,
         packages_span: tuple[int, int] | None = None,
         failure_tail: str | None = None,
-    ) -> str | None:
+    ) -> mutations_yaml.ValidationVerdict:
         return await mutations_yaml.validate_rewritten_yaml_or_raise(
             self._db.editor,
             configuration,
             content,
             action=action,
             on_failure=on_failure,
-            on_error_cleanup=on_error_cleanup,
             tolerate_unavailable=tolerate_unavailable,
             timeout=timeout,
             packages_span=packages_span,
@@ -840,29 +843,40 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
     @api_command("devices/get_config")
     async def get_config(self, *, configuration: str, **kwargs: Any) -> str:
         """Read device config YAML; a missing file is NOT_FOUND, not internal_error."""
-        try:
-            return await self._read_yaml_async(self._db.settings.rel_path(configuration))
-        except FileNotFoundError as err:
-            raise_device_not_found(configuration, from_exc=err)
+        return await read_device_config_async(self._db.settings, configuration)
 
     @api_command("devices/update_config")
     async def update_config(
-        self, *, configuration: str, content: str, allow_wipe: bool = False, **kwargs: Any
+        self,
+        *,
+        configuration: str,
+        content: str,
+        allow_wipe: bool = False,
+        expected: str | None = None,
+        **kwargs: Any,
     ) -> None:
         """
         Write device config YAML.
 
         ``allow_wipe`` permits clearing secrets.yaml to empty; without it an
         empty secrets save is refused. An empty device YAML is always refused.
+        With ``expected``, a device YAML is written only while it still holds
+        that text (``PRECONDITION_FAILED`` otherwise); secrets.yaml refuses it.
         """
         if not isinstance(allow_wipe, bool):
             raise CommandError(ErrorCode.INVALID_ARGS, "allow_wipe must be a boolean")
+        if expected is not None and not isinstance(expected, str):
+            raise CommandError(ErrorCode.INVALID_ARGS, "expected must be a string")
         is_empty = not content.strip()
         if is_secrets_file(configuration):
+            secrets_name = Path(configuration).name
+            if expected is not None:
+                msg = f"expected is not supported for {secrets_name}"
+                raise CommandError(ErrorCode.INVALID_ARGS, msg)
             if is_empty and not allow_wipe:
                 raise CommandError(
                     ErrorCode.INVALID_ARGS,
-                    "refusing to clear all secrets from secrets.yaml without "
+                    f"refusing to clear all secrets from {secrets_name} without "
                     "confirmation; pass allow_wipe to confirm",
                 )
             try:
@@ -870,7 +884,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
             except SecretsContentError as err:
                 raise CommandError(
                     ErrorCode.INVALID_ARGS,
-                    f"refusing to save invalid secrets.yaml: {err}",
+                    f"refusing to save invalid {secrets_name}: {err}",
                 ) from err
             # Hold the shared lock so a whole-file save can't interleave with a
             # per-key config/set_secret. A full save still replaces the document
@@ -881,12 +895,14 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
                 )
             return
         if is_empty:
-            raise CommandError(
-                ErrorCode.INVALID_ARGS,
-                f"refusing to write empty content to {configuration!r} to prevent "
-                "accidental data loss; use the delete action to remove a file",
+            refuse_empty_write(configuration)
+        message = f"Edit {configuration}"
+        if expected is not None:
+            await persist_if_unchanged(
+                self, configuration, content, expected=expected, message=message
             )
-        await self._persist_yaml_mutation(configuration, content, message=f"Edit {configuration}")
+            return
+        await self._persist_yaml_mutation(configuration, content, message=message)
 
     async def apply_restored_yaml(
         self, configuration: str, content: str, *, restored_from: str
@@ -895,6 +911,27 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         await self._persist_yaml_mutation(
             configuration, content, message=f"Restore {configuration} to {restored_from}"
         )
+
+    async def rewrite_yaml[T](
+        self, configuration: str, rewrite: Callable[[str], tuple[str, T]], *, message: str
+    ) -> T:
+        """Read, rewrite and save a device *configuration* as one job under its write lock."""
+        if is_secrets_file(configuration):
+            raise CommandError(ErrorCode.INVALID_ARGS, f"{configuration} is not a device config")
+
+        def _rewrite() -> T:
+            path = self._db.settings.rel_path(configuration)
+            new_text, result = rewrite(read_device_config(path, configuration))
+            if not new_text.strip():
+                refuse_empty_write(configuration)
+            write_user_yaml(path, new_text)
+            return result
+
+        async with self._yaml_write_lock(configuration):
+            result = await run_in_executor(_rewrite)
+            await self._commit_history(configuration, message)
+        self._after_yaml_write(configuration)
+        return result
 
     def _schedule_storage_regenerate(self, configuration: str) -> None:
         storage_regen.schedule(self, configuration)
@@ -1110,6 +1147,10 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         async with self._yaml_write_lock(configuration):
             await self._write_yaml_atomic_async(self._db.settings.rel_path(configuration), content)
             await self._commit_history(configuration, message or f"Update {configuration}")
+        self._after_yaml_write(configuration)
+
+    def _after_yaml_write(self, configuration: str) -> None:
+        """Drop the editor caches and reload *configuration* after a write."""
         # A write here (device YAML, or the whole-file secrets.yaml editor)
         # can change what any open editor's lint resolves; clear the caches
         # so the next validate re-reads disk instead of the stale result.
@@ -1122,9 +1163,11 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
 
     def _yaml_write_lock(self, configuration: str) -> asyncio.Lock:
         """Return the per-file lock guarding a YAML write + its history commit."""
-        lock = self._yaml_write_locks.get(configuration)
+        # Lexical, so every spelling of one path (``foo/../kitchen.yaml``) shares a lock.
+        key = os.path.normpath(configuration)
+        lock = self._yaml_write_locks.get(key)
         if lock is None:
-            lock = self._yaml_write_locks[configuration] = asyncio.Lock()
+            lock = self._yaml_write_locks[key] = asyncio.Lock()
         return lock
 
     async def _commit_history(self, configuration: str, message: str) -> None:
@@ -1163,13 +1206,9 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         """
         Make a freshly written config visible: reset metadata, commit, scan.
 
-        Shared tail of ``create_device`` and ``import_bundle``. For a new
-        device, clearing metadata first stops an archived board_id from
-        mis-binding to a fresh device reusing the same filename. An
-        *overwrite* of an existing device passes ``clear_metadata=False``
-        so its labels / comment / board_id survive. *board_id* is persisted
-        only when explicitly chosen. The scan fires ``_on_scan_change``
-        (ADDED), which probes the device, so callers must not double-probe.
+        ``clear_metadata=False`` keeps an overwritten device's labels / comment /
+        board_id; *board_id* is persisted as user-chosen. The scan's ADDED handler
+        probes the device (callers must not double-probe); a scan I/O failure is logged.
         """
         if clear_metadata:
             await self._delete_device_metadata(configuration)
@@ -1178,12 +1217,21 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
                 configuration, board_id=board_id, board_id_user_set=True
             )
         await self._commit_history(configuration, commit_message)
-        await self._scanner.scan()
+        try:
+            await self._scanner.scan()
+        except OSError:
+            _LOGGER.exception("Scan after writing %s failed", configuration)
 
-    @staticmethod
-    async def _read_yaml_async(path: Path) -> str:
-        """Read *path* as UTF-8 text off the executor."""
-        return await run_in_executor(path.read_text, "utf-8")
+    async def _load_ignored_devices(self) -> None:
+        """Seed ``state.ignored_devices`` from disk, in place."""
+        if (names := await self._ignored_devices_store.async_load()) is not None:
+            self.state.ignored_devices.clear()
+            self.state.ignored_devices.update(names)
+
+    def _schedule_ignored_devices_save(self) -> None:
+        self._ignored_devices_store.async_delay_save(
+            lambda: set(self.state.ignored_devices), delay=_IGNORED_DEVICES_SAVE_DELAY
+        )
 
     def _on_scan_change(
         self, kind: ScanChange, device: Device, previous: Device | None = None
@@ -1208,6 +1256,7 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         return reachability.build_snapshot(self, name)
 
     def _on_reachability_observation(self, name: str) -> None:
+        state_callbacks.record_last_seen(self, name)
         reachability.on_observation(self, name)
 
     def get_reachability_snapshot(self, name: str) -> DeviceReachabilityData | None:
@@ -1242,6 +1291,9 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
     def _on_deployed_identity_live_change(self, name: str, *, live: bool) -> None:
         state_callbacks.on_deployed_identity_live_change(self, name, live=live)
 
+    def _on_ota_signed_change(self, name: str, *, signed: bool) -> None:
+        state_callbacks.on_ota_signed_change(self, name, signed=signed)
+
     def _on_version_change(self, name: str, version: str) -> None:
         state_callbacks.on_version_change(self, name, version)
 
@@ -1253,12 +1305,6 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
 
     def _on_config_hash_change(self, name: str, config_hash: str) -> None:
         state_callbacks.on_config_hash_change(self, name, config_hash)
-
-    def _on_project_name_change(self, name: str, project_name: str) -> None:
-        state_callbacks.on_project_name_change(self, name, project_name)
-
-    def _on_project_version_change(self, name: str, project_version: str) -> None:
-        state_callbacks.on_project_version_change(self, name, project_version)
 
     def _on_network_change(self, name: str, network: str) -> None:
         state_callbacks.on_network_change(self, name, network)
@@ -1307,12 +1353,6 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
             build_size_info_mtime=result.signal.info_mtime,
         )
 
-    def _load_ignored_devices(self) -> None:
-        importable.load_ignored_devices(self)
-
-    def _save_ignored_devices(self) -> None:
-        importable.save_ignored_devices(self)
-
     async def _archive_single(self, configuration: str) -> None:
         await archive.archive_single(self, configuration)
 
@@ -1335,5 +1375,16 @@ class DevicesController(  # noqa: PLR0904 (grandfathered; new public methods nee
         message_id: str,
         *,
         line_transform: Callable[[str], str] | None = None,
+        slot: asyncio.Semaphore | None = None,
+        slot_timeout: float | None = None,
+        idle_timeout: float | None = None,
     ) -> None:
-        await logs.stream_subprocess(cmd, client, message_id, line_transform=line_transform)
+        await logs.stream_subprocess(
+            cmd,
+            client,
+            message_id,
+            line_transform=line_transform,
+            slot=slot,
+            slot_timeout=slot_timeout,
+            idle_timeout=idle_timeout,
+        )

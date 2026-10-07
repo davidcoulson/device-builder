@@ -4,36 +4,40 @@ Automations controller — the eight WS commands the frontend speaks.
 See ``docs/API.md`` for the per-command contract. ``upsert`` /
 ``delete`` return a :class:`YamlDiff` the frontend applies in
 place; the backend does not persist the YAML — the existing
-config-write debounce on the device editor handles that.
+config-write debounce on the device editor handles that. ``save``
+on either rewrites the file instead, for callers with no editor.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from ruamel.yaml import YAMLError
 
 from ...helpers.api import CommandError, api_command
 from ...helpers.async_ import run_in_executor
+from ...helpers.device_config import read_device_config
+from ...helpers.json import dumps_str
+from ...helpers.text import diff_excerpt, same_text
 from ...models.api import ErrorCode
 from ...models.automations import (
-    ApiActionLocation,
+    LOCATION_FIELDS,
+    LOCATION_TYPES,
     AutomationLocation,
     AutomationTree,
     AvailableAutomations,
     AvailableComponentInstance,
     AvailableScript,
     AvailableScriptParameter,
-    ComponentActionFieldLocation,
-    ComponentOnLocation,
-    DeviceOnLocation,
-    IntervalLocation,
-    LightEffectLocation,
-    ScriptLocation,
+    ParsedAutomation,
     UpsertResponse,
+    YamlDiff,
 )
 from . import catalog, parsing, writing
+from .addressing import require_writable
 from .catalog import AutomationBodyRef
 
 if TYPE_CHECKING:
@@ -119,18 +123,10 @@ class AutomationsController:
         *,
         refs: list[AutomationBodyRef],
         **_kwargs: Any,
-    ) -> dict[str, dict]:
-        """Hydrate full automation bodies in one batched round trip.
-
-        ``refs`` is a list of ``{"type": str, "id": str}`` entries
-        where ``type`` is one of ``triggers`` / ``actions`` /
-        ``conditions`` / ``light_effects`` / ``filters``. The
-        response is keyed by ``"<type>/<id>"`` and carries the
-        full body (config_entries tree included). Unknown or
-        missing ids are absent. Mirrors
-        ``components/get_component_bodies`` from #424.
-        """
-        return await catalog.get_bodies(refs)
+    ) -> dict[str, Any]:
+        """Hydrate bodies as ``{bodies, remaining}``; re-request ``remaining`` for the rest."""
+        bodies, remaining = await catalog.get_bodies(refs, catalog.GET_BODIES_MAX_BYTES)
+        return {"bodies": bodies, "remaining": remaining}
 
     # ------------------------------------------------------------------
     # Device-scoped helpers
@@ -160,8 +156,7 @@ class AutomationsController:
         *configuration* from disk (same override as ``parse`` /
         ``upsert`` / ``delete``).
         """
-        text = yaml if yaml is not None else await self._read_config(configuration)
-        scoped = await run_in_executor(_scope_from_yaml, text)
+        scoped = await self._run_on_config(configuration, yaml, _scope_from_yaml)
         # Scope builders are catalog-free; stamp the catalog title here.
         components = self._db.components
         if components is not None:
@@ -194,8 +189,7 @@ class AutomationsController:
         stale on-disk YAML, fails to find the new automation, and
         the form lands empty.
         """
-        text = yaml if yaml is not None else await self._read_config(configuration)
-        parsed = await run_in_executor(parsing.parse_device_yaml, text)
+        parsed = await self._run_on_config(configuration, yaml, parsing.parse_device_yaml)
         return [p.to_dict() for p in parsed]
 
     @api_command("automations/upsert")
@@ -206,9 +200,17 @@ class AutomationsController:
         automation: dict,
         location: dict,
         yaml: str | None = None,
+        save: bool = False,
+        expected: str | None = None,
         **_kwargs: Any,
     ) -> dict:
         """Insert or replace one automation at *location*.
+
+        ``save`` rewrites the on-disk config, so it is refused beside ``yaml``.
+        With ``save`` or ``expected`` (the ``raw_yaml`` a parse returned for the
+        automation being replaced) the write is guarded: a replace needs
+        ``expected`` to still match and an insert must keep every other
+        automation, else ``PRECONDITION_FAILED`` with nothing written.
 
         The frontend has an in-memory draft buffer that may already
         contain an earlier auto-applied version of this automation
@@ -225,13 +227,27 @@ class AutomationsController:
         from disk — convenient for tooling that doesn't track its
         own buffer.
         """
-        tree = AutomationTree.from_dict(automation)
+        _check_save_args(save=save, yaml=yaml, expected=expected)
+        try:
+            tree = AutomationTree.from_dict(automation)
+        except (LookupError, ValueError, TypeError) as err:
+            raise CommandError(ErrorCode.INVALID_ARGS, f"Invalid automation: {err}") from err
         loc = _decode_location(location)
-        text = yaml if yaml is not None else await self._read_config(configuration)
-        _new_text, diff = await run_in_executor(
-            lambda: writing.render_upsert(text, tree=tree, location=loc),
+        render: Callable[[str], tuple[str, YamlDiff]]
+        guarded = save or expected is not None
+        if guarded:
+            render = partial(
+                _render_upsert_if_unchanged, tree=tree, location=loc, expected=expected
+            )
+        else:
+            render = partial(writing.render_upsert, tree=tree, location=loc)
+        return await self._apply(
+            configuration,
+            yaml,
+            partial(_render_writable, location=loc, render=render, declared_only=not guarded),
+            save=save,
+            message=f"Save an automation to {configuration}",
         )
-        return UpsertResponse(yaml_diff=diff).to_dict()
 
     @api_command("automations/delete")
     async def delete(
@@ -240,29 +256,66 @@ class AutomationsController:
         configuration: str,
         location: dict,
         yaml: str | None = None,
+        save: bool = False,
+        expected: str | None = None,
         **_kwargs: Any,
     ) -> dict:
         """Delete the automation at *location*.
 
-        Accepts the same optional ``yaml`` override as ``upsert``
-        so the delete is computed against the frontend's current
-        draft buffer when one exists.
+        Accepts the same ``yaml`` draft override and ``save`` as ``upsert``.
+        With ``expected``, the ``raw_yaml`` a parse returned for the automation,
+        the delete happens only while it still reads that way
+        (``PRECONDITION_FAILED``).
         """
+        _check_save_args(save=save, yaml=yaml, expected=expected)
         loc = _decode_location(location)
-        text = yaml if yaml is not None else await self._read_config(configuration)
-        _new_text, diff = await run_in_executor(
-            lambda: writing.render_delete(text, location=loc),
+        render: Callable[[str], tuple[str, YamlDiff]]
+        if expected is None:
+            render = partial(writing.render_delete, location=loc)
+        else:
+            render = partial(_render_delete_if_unchanged, location=loc, expected=expected)
+        return await self._apply(
+            configuration,
+            yaml,
+            partial(_render_writable, location=loc, render=render),
+            save=save,
+            message=f"Delete an automation from {configuration}",
         )
-        return UpsertResponse(yaml_diff=diff).to_dict()
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    async def _read_config(self, configuration: str) -> str:
-        """Read a device's YAML off disk in a worker thread."""
-        path = self._db.settings.rel_path(configuration)
-        return await run_in_executor(path.read_text, "utf-8")
+    async def _apply(
+        self,
+        configuration: str,
+        yaml: str | None,
+        render: Callable[[str], tuple[str, YamlDiff]],
+        *,
+        save: bool,
+        message: str,
+    ) -> dict:
+        """Run *render* over the draft or the file, or with *save* rewrite the file in place."""
+        if not save:
+            _new_text, diff = await self._run_on_config(configuration, yaml, render)
+        elif (devices := self._db.devices) is None:
+            raise CommandError(ErrorCode.INTERNAL_ERROR, "devices controller unavailable")
+        else:
+            diff = await devices.rewrite_yaml(configuration, render, message=message)
+        return UpsertResponse(yaml_diff=diff).to_dict()
+
+    async def _run_on_config[T](
+        self, configuration: str, yaml: str | None, func: Callable[[str], T]
+    ) -> T:
+        """Run *func* over the *yaml* draft, else the on-disk config, as one executor job."""
+        if yaml is not None:
+            return await run_in_executor(func, yaml)
+
+        def _read_and_run() -> T:
+            path = self._db.settings.rel_path(configuration)
+            return func(read_device_config(path, configuration))
+
+        return await run_in_executor(_read_and_run)
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +364,8 @@ def _scope_from_yaml(text: str) -> _ScopedYaml:
     devices: list[AvailableComponentInstance] = []
     domains: set[str] = set(data.keys())
 
-    if isinstance(data.get("script"), list):
-        scripts = _scope_scripts(data["script"])
+    if (listed := parsing.listed_block(data, "script")) is not None:
+        scripts = _scope_scripts(listed[0])
     # ``devices`` ships to the frontend in this order; keep document-order
     # iteration (a ``set()`` wrap hash-shuffles it per process).
     for domain in data:
@@ -416,29 +469,128 @@ def _component_instance(
     )
 
 
-# Map each discriminator to its concrete location type; ``_decode_location``
-# resolves ``from_dict`` per call. Capturing a bound ``from_dict`` here would,
-# under mashumaro ``lazy_compilation``, hold the one-shot stub and recompile the
-# unpacker on every call; a class-attribute lookup hits the compiled method
-# after first use.
-_LOCATION_TYPES: dict[str, type[AutomationLocation]] = {
-    "script": ScriptLocation,
-    "interval": IntervalLocation,
-    "component_on": ComponentOnLocation,
-    "component_action": ComponentActionFieldLocation,
-    "device_on": DeviceOnLocation,
-    "light_effect": LightEffectLocation,
-    "api_action": ApiActionLocation,
-}
-
-
 def _decode_location(raw: dict) -> AutomationLocation:
     """Convert a wire-shape ``{kind: ...}`` dict into a typed location."""
     if not isinstance(raw, dict) or "kind" not in raw:
         msg = f"location must carry a 'kind' discriminator; got {raw!r}"
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
     kind = raw["kind"]
-    if not isinstance(kind, str) or (loc_type := _LOCATION_TYPES.get(kind)) is None:
+    if not isinstance(kind, str) or (loc_type := LOCATION_TYPES.get(kind)) is None:
         msg = f"Unknown location kind: {kind!r}"
         raise CommandError(ErrorCode.INVALID_ARGS, msg)
-    return loc_type.from_dict(raw)
+    if extra := set(raw) - LOCATION_FIELDS[kind]:
+        msg = f"{kind} location does not take {sorted(extra)}"
+        raise CommandError(ErrorCode.INVALID_ARGS, msg)
+    # Resolve ``from_dict`` per call: a bound method captured at import holds
+    # mashumaro's one-shot ``lazy_compilation`` stub and recompiles every call.
+    try:
+        return loc_type.from_dict(raw)
+    except (LookupError, ValueError, TypeError) as err:
+        raise CommandError(ErrorCode.INVALID_ARGS, f"Invalid {kind} location: {err}") from err
+
+
+def _check_save_args(*, save: bool, yaml: str | None, expected: str | None) -> None:
+    """Validate the ``save`` / ``expected`` wire args."""
+    if not isinstance(save, bool):
+        raise CommandError(ErrorCode.INVALID_ARGS, "save must be a boolean")
+    if save and yaml is not None:
+        raise CommandError(ErrorCode.INVALID_ARGS, "save writes the config on disk; omit yaml")
+    if expected is not None and not isinstance(expected, str):
+        raise CommandError(ErrorCode.INVALID_ARGS, "expected must be a string")
+
+
+def _rows(yaml_text: str) -> list[ParsedAutomation]:
+    """Parse *yaml_text*'s automations; an unloadable file fails the precondition."""
+    try:
+        return parsing.parse_device_yaml(yaml_text)
+    except CommandError as err:
+        if err.code is not ErrorCode.INVALID_ARGS:
+            raise
+        msg = f"the config no longer loads, nothing was written: {err.message}"
+        raise CommandError(ErrorCode.PRECONDITION_FAILED, msg) from err
+
+
+def _rendered_rows(new_text: str) -> list[ParsedAutomation]:
+    """Parse the writer's output; a result that no longer loads is a logged writer fault."""
+    try:
+        return parsing.parse_device_yaml(new_text)
+    except CommandError as err:
+        if err.code is not ErrorCode.INVALID_ARGS:
+            raise
+        _LOGGER.exception("Automation rewrite produced a config that does not load")
+        msg = (
+            f"the rewrite produced a config that does not load, nothing was written: {err.message}"
+        )
+        raise CommandError(ErrorCode.INTERNAL_ERROR, msg) from err
+
+
+def _require_expected(
+    rows: list[ParsedAutomation], location: AutomationLocation, expected: str
+) -> None:
+    """Raise ``PRECONDITION_FAILED`` unless the row at *location* still reads as *expected*."""
+    row = next((p for p in rows if p.location == location), None)
+    if row is None:
+        msg = "no automation at that location any more; list again and retry"
+        raise CommandError(ErrorCode.PRECONDITION_FAILED, msg)
+    if not same_text(row.raw_yaml, expected):
+        msg = (
+            "the automation at that location differs from the expected text; nothing was "
+            f"written, list again and retry\n{diff_excerpt(expected, row.raw_yaml)}"
+        )
+        raise CommandError(ErrorCode.PRECONDITION_FAILED, msg)
+
+
+def _render_writable(
+    yaml_text: str,
+    *,
+    location: AutomationLocation,
+    render: Callable[[str], tuple[str, YamlDiff]],
+    declared_only: bool = False,
+) -> tuple[str, YamlDiff]:
+    """Run *render* only while *location* names the one item of *yaml_text* it may write."""
+    require_writable(yaml_text, location, declared_only=declared_only)
+    return render(yaml_text)
+
+
+def _render_delete_if_unchanged(
+    yaml_text: str, *, location: AutomationLocation, expected: str
+) -> tuple[str, YamlDiff]:
+    """Delete the automation at *location* only while its text still equals *expected*."""
+    _require_expected(_rows(yaml_text), location, expected)
+    return writing.render_delete(yaml_text, location=location)
+
+
+def _content(row: ParsedAutomation) -> tuple[str | None, str | None, bool]:
+    """Return what a surviving row must keep across a rewrite, serialised so NaN compares equal."""
+    tree = dumps_str(row.automation.to_dict()) if row.automation is not None else None
+    return tree, row.error, row.unsupported
+
+
+def _render_upsert_if_unchanged(
+    yaml_text: str, *, tree: AutomationTree, location: AutomationLocation, expected: str | None
+) -> tuple[str, YamlDiff]:
+    """Insert one automation and keep every other, or replace only the one matching *expected*."""
+    before = _rows(yaml_text)
+    if expected is not None:
+        _require_expected(before, location, expected)
+    new_text, diff = writing.render_upsert(yaml_text, tree=tree, location=location)
+    after = _rendered_rows(new_text)
+    landed = next((p for p in after if p.location == location), None)
+    if landed is None:  # pragma: no cover — every writer path raises for an index it cannot honour
+        msg = (
+            "no automation landed at that location, nothing was written; for a list, index "
+            "must not exceed the current length"
+        )
+        raise CommandError(ErrorCode.INVALID_ARGS, msg)
+    # Compared by content: an insert may turn a bare action list into then:
+    # entries, which renumbers the surviving rows.
+    kept = [_content(p) for p in before if expected is None or p.location != location]
+    if [_content(p) for p in after if p is not landed] != kept:
+        msg = (
+            "the automation at that location could not be replaced in place; nothing was written"
+            if expected is not None
+            else "that location already holds YAML; pass the automation's raw_yaml from a "
+            "listing as expected to replace it"
+        )
+        raise CommandError(ErrorCode.PRECONDITION_FAILED, msg)
+    return new_text, diff

@@ -1,9 +1,9 @@
 """Tests for the ``devices/clone`` command path.
 
-Covers the user-correctable failures (collision, empty / equal name,
-missing source) as typed ``CommandError(INVALID_ARGS, …)`` so the
-clone dialog can show specific messages rather than a generic
-"Command failed" fallback. Also covers the happy path: the new YAML
+Covers the user-correctable failures (collision, empty / equal name as
+``INVALID_ARGS``, a missing source as ``NOT_FOUND``) as typed
+``CommandError`` so the clone dialog can show specific messages rather
+than a generic "Command failed" fallback. Also covers the happy path: the new YAML
 swaps ``esphome.name`` / ``friendly_name``, regenerates the API
 encryption key, leaves ``!secret`` indirections alone, and triggers
 a scan so the new file shows up in the next ``devices/list``.
@@ -402,14 +402,14 @@ async def test_clone_device_rejects_missing_source(
     tmp_path: Path,
     make_controller: MakeControllerFactory,
 ) -> None:
-    """A source filename that doesn't exist raises ``INVALID_ARGS``."""
+    """A source filename that doesn't exist raises ``NOT_FOUND``."""
     ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
 
     with pytest.raises(CommandError) as excinfo:
         await ctrl.clone_device(configuration="ghost.yaml", new_name="bedroom-bulb")
 
-    assert excinfo.value.code == ErrorCode.INVALID_ARGS
-    assert "ghost.yaml not found" in excinfo.value.message
+    assert excinfo.value.code == ErrorCode.NOT_FOUND
+    assert "ghost.yaml" in excinfo.value.message
 
 
 @pytest.mark.usefixtures("stub_create_device_metadata_helpers")
@@ -659,6 +659,28 @@ async def test_clone_device_carries_source_board_id_into_metadata(
     assert meta is not None
     assert meta["board_id"] == "esp32-s3-devkitc-1"
     assert meta["board_id_user_set"] is True
+
+
+async def test_clone_device_clears_stale_metadata_under_the_target_name(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """Metadata left under the target filename is cleared before the carried board id lands."""
+    config_dir = tmp_path
+    await asyncio.to_thread(
+        set_device_metadata, config_dir, "kitchen.yaml", board_id="esp32dev", board_id_user_set=True
+    )
+    await asyncio.to_thread(
+        set_device_metadata, config_dir, "bedroom-bulb.yaml", board_id="old", labels=["stale"]
+    )
+    (tmp_path / "kitchen.yaml").write_text(SOURCE_YAML, "utf-8")
+    ctrl = make_controller(tmp_path, with_state_monitor=True, with_boards=True)
+    ctrl._db.settings.config_dir = config_dir
+
+    await ctrl.clone_device(configuration="kitchen.yaml", new_name="bedroom-bulb")
+
+    meta = await asyncio.to_thread(get_device_metadata, config_dir, "bedroom-bulb.yaml")
+    assert meta == {"board_id": "esp32dev", "board_id_user_set": True}
 
 
 async def test_clone_device_drops_auto_derived_source_board_id(

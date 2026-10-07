@@ -16,6 +16,7 @@ from ...definitions import load_platform_capabilities_index
 from ...models.boards import RP2_PLATFORM_ALIASES, normalize_platform
 from ..chips import normalize_chip_variant
 from ..yaml import (
+    ESPHOME_NAME_ADD_MAC_SUFFIX_PATH,
     TRUTHY_BOOL_STRINGS,
     _split_value_and_comment,
     _strip_yaml_quotes,
@@ -108,18 +109,22 @@ def configuration_filename(name: str) -> str:
 
 
 def parse_platform_from_yaml(yaml_content: str) -> tuple[str, str, str]:
-    """
-    Extract ``(platform, pio_board, variant)`` from device YAML content.
+    """Extract ``(platform, pio_board, variant)``; see ``parse_platform_fields``."""
+    platform, fields = parse_platform_fields(yaml_content, ("board", "variant"))
+    return platform, fields["board"], fields["variant"]
 
-    Looks at top-level platform keys (``esp32:``, ``esp8266:``, …) and
-    reads the ``board:`` and ``variant:`` fields nested under them.
-    Returns empty strings for fields that aren't present.
+
+def parse_platform_fields(yaml_content: str, keys: tuple[str, ...]) -> tuple[str, dict[str, str]]:
+    """
+    Extract the platform and the *keys* nested under it from device YAML content.
+
+    Looks at top-level platform keys (``esp32:``, ``esp8266:``, …) in the raw
+    text, so it sees neither packages nor substitutions. Every key comes
+    back, empty where the YAML has none.
     """
     platform = ""
-    pio_board = ""
-    variant = ""
+    fields = dict.fromkeys(keys, "")
     in_platform = False
-
     for line in yaml_content.splitlines():
         top_key = _match_top_level_key(line)
         if top_key is not None:
@@ -131,13 +136,10 @@ def parse_platform_from_yaml(yaml_content: str) -> tuple[str, str, str]:
             continue
         if not in_platform:
             continue
-        stripped = line.strip()
-        if stripped.startswith("board:"):
-            pio_board = stripped.split(":", 1)[1].strip().strip('"').strip("'")
-        elif stripped.startswith("variant:"):
-            variant = stripped.split(":", 1)[1].strip().strip('"').strip("'")
-
-    return platform, pio_board, variant
+        key, colon, value = line.strip().partition(":")
+        if colon and key in fields:
+            fields[key] = _strip_yaml_quotes(_split_value_and_comment(value)[0])
+    return platform, fields
 
 
 def detect_platform_from_yaml(yaml_content: str, resolved_config: dict | None) -> str:
@@ -274,7 +276,7 @@ def _truthy_child_re(block: str, key: str) -> re.Pattern[str]:
     )
 
 
-_RAW_NAME_ADD_MAC_SUFFIX_RE = _truthy_child_re("esphome", "name_add_mac_suffix")
+_RAW_NAME_ADD_MAC_SUFFIX_RE = _truthy_child_re(*ESPHOME_NAME_ADD_MAC_SUFFIX_PATH)
 _RAW_MDNS_DISABLED_RE = _truthy_child_re("mdns", "disabled")
 
 
@@ -405,24 +407,32 @@ def extract_directly_referenced_integrations(
     Non-string ``platform:`` values (templated lambdas, malformed
     drafts) are skipped silently rather than emitting garbage names.
     """
-    if not isinstance(config, dict):
-        return []
     out: set[str] = set()
+    for key, platform in _iter_component_refs(config):
+        out.add(platform or key)
+    return sorted(out)
+
+
+def extract_component_ids(config: dict | None) -> list[str]:
+    """Catalog ids a resolved config references, in YAML order: ``key`` and ``key.platform``."""
+    ids = [
+        f"{key}.{platform}" if platform else key for key, platform in _iter_component_refs(config)
+    ]
+    return list(dict.fromkeys(ids))
+
+
+def _iter_component_refs(config: dict | None) -> Iterator[tuple[str, str | None]]:
+    """Yield ``(key, None)`` per top-level block and ``(key, platform)`` per ``platform:`` ref."""
+    if not isinstance(config, dict):
+        return
     for key, value in config.items():
         if not isinstance(key, str) or is_ignored_top_level_key(key):
             continue
-        out.add(key)
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    platform = item.get("platform")
-                    if isinstance(platform, str) and platform:
-                        out.add(platform)
-        elif isinstance(value, dict):
-            platform = value.get("platform")
+        yield key, None
+        for block in value if isinstance(value, list) else [value]:
+            platform = block.get("platform") if isinstance(block, dict) else None
             if isinstance(platform, str) and platform:
-                out.add(platform)
-    return sorted(out)
+                yield key, platform
 
 
 def parse_esphome_meta(

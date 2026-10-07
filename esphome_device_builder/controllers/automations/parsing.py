@@ -54,7 +54,6 @@ from ...models.automations import (
 )
 from . import catalog
 from ._decompose import (
-    DEFAULT_SHORTHAND_KEY,
     _block_tree,
     _collect_api_action_params,
     _collect_block_params,
@@ -72,7 +71,6 @@ from ._ranges import _dump_slice, _estimate_end_line, _item_range, _key_range, _
 from ._yaml import make_yaml
 
 __all__ = [
-    "DEFAULT_SHORTHAND_KEY",
     "_decompose_action",
     "_decompose_action_list",
     "_decompose_condition",
@@ -185,22 +183,24 @@ def _parse_automation_list(
     *,
     describe: Callable[[dict[str, Any], int], tuple[AutomationLocation, str] | None],
     params_of: Callable[[dict[str, Any]], dict[str, Any]],
+    range_of: Callable[[int], tuple[int, int]],
 ) -> list[ParsedAutomation]:
     """
     Parse one top-level list block of trigger-less automations.
 
     *describe* returns the item's ``(location, label)`` or ``None`` to
-    skip it; *params_of* collects the item's params for the tree build.
+    skip it; *params_of* collects the item's params for the tree build;
+    *range_of* maps an index to its line range.
     """
     out: list[ParsedAutomation] = []
     for idx, item in enumerate(items):
-        if not isinstance(item, dict):
+        if not is_mapping_entry(item):
             continue
         described = describe(item, idx)
         if described is None:
             continue
         location, label = described
-        from_line, to_line = _item_range(items, idx)
+        from_line, to_line = range_of(idx)
         tree, error, unsupported = _safe_tree(
             partial(_block_tree, params_of(item), item.get("then")),
             trigger_id=None,
@@ -222,30 +222,29 @@ def _parse_automation_list(
 
 def _parse_top_level_scripts(root: Any) -> list[ParsedAutomation]:
     """Parse top-level ``script:`` list blocks."""
-    if not isinstance(root, dict):
+    listed = listed_block(root, "script")
+    if listed is None:
         return []
-    scripts = root.get("script")
-    if not isinstance(scripts, list):
-        return []
+    scripts, range_of = listed
 
     def _describe(item: dict[str, Any], idx: int) -> tuple[AutomationLocation, str]:
-        script_id = item.get("id") or f"script_{idx}"
-        return ScriptLocation(id=str(script_id)), f"Script: {script_id}"
+        script_id = instance_id("script", item, idx, is_list=True)
+        return ScriptLocation(id=script_id), f"Script: {script_id}"
 
     return _parse_automation_list(
         scripts,
         describe=_describe,
         params_of=partial(_collect_block_params, action_list_keys={"then"}),
+        range_of=range_of,
     )
 
 
 def _parse_top_level_intervals(root: Any) -> list[ParsedAutomation]:
     """Parse top-level ``interval:`` list blocks."""
-    if not isinstance(root, dict):
+    listed = listed_block(root, "interval")
+    if listed is None:
         return []
-    intervals = root.get("interval")
-    if not isinstance(intervals, list):
-        return []
+    intervals, range_of = listed
 
     def _describe(item: dict[str, Any], idx: int) -> tuple[AutomationLocation, str]:
         every = item.get("interval")
@@ -256,7 +255,20 @@ def _parse_top_level_intervals(root: Any) -> list[ParsedAutomation]:
         intervals,
         describe=_describe,
         params_of=partial(_collect_block_params, action_list_keys={"then"}),
+        range_of=range_of,
     )
+
+
+def listed_block(root: Any, key: str) -> tuple[list[Any], Callable[[int], tuple[int, int]]] | None:
+    """Return a top-level block as a list plus its per-index line range; a mapping is one entry."""
+    if not isinstance(root, dict):
+        return None
+    block = root.get(key)
+    if isinstance(block, list):
+        return block, partial(_item_range, block)
+    if isinstance(block, dict):
+        return [block], lambda _idx: _key_range(root, key)
+    return None
 
 
 def _parse_api_actions(root: Any) -> list[ParsedAutomation]:
@@ -287,7 +299,12 @@ def _parse_api_actions(root: Any) -> list[ParsedAutomation]:
             return None
         return ApiActionLocation(action_name=str(action_name)), f"API: {action_name}"
 
-    return _parse_automation_list(actions, describe=_describe, params_of=_collect_api_action_params)
+    return _parse_automation_list(
+        actions,
+        describe=_describe,
+        params_of=_collect_api_action_params,
+        range_of=partial(_item_range, actions),
+    )
 
 
 def singleton_component_id(section: dict, domain: str) -> str:
@@ -366,7 +383,7 @@ def resolve_component_target(yaml_text: str, component_id: str) -> ComponentTarg
         root = yaml.load(yaml_text)
     except Exception:  # noqa: BLE001 — any load failure falls back to the catalog guess
         return None
-    for _domain, _instance, comp_id, target in _iter_instance_targets(root):
+    for _domain, _instance, comp_id, target in iter_instance_targets(root):
         if comp_id == component_id:
             return target
     return None
@@ -384,15 +401,15 @@ def instance_id(domain: str, instance: dict, idx: int, *, is_list: bool) -> str:
     return singleton_component_id(instance, domain)
 
 
-def _iter_instance_targets(
+def iter_instance_targets(
     root: Any,
 ) -> Iterator[tuple[str, dict, str, ComponentTarget]]:
     """
     Yield ``(domain, instance, comp_id, target)`` for every instance + sub-entity.
 
-    The one document walk shared by :func:`_parse_inline_component_triggers`
-    and :func:`resolve_component_target` (list instances, flat singletons,
-    nested sub-entities).
+    The one document walk shared by :func:`_parse_inline_component_triggers`,
+    :func:`resolve_component_target` and ``addressing`` (list instances, flat
+    singletons, nested sub-entities).
     """
     if not isinstance(root, dict):
         return
@@ -460,7 +477,7 @@ def iter_subentities(
 def _parse_inline_component_triggers(root: Any) -> list[ParsedAutomation]:
     """Walk component instances for inline ``on_*:`` handlers."""
     out: list[ParsedAutomation] = []
-    for domain, instance, comp_id, target in _iter_instance_targets(root):
+    for domain, instance, comp_id, target in iter_instance_targets(root):
         if not catalog.hosts_component_triggers(domain, target.trigger_scope):
             continue
         out.extend(
@@ -573,7 +590,7 @@ def _parse_component_action_fields(root: Any) -> list[ParsedAutomation]:
     inline ``on_*`` handlers (``trigger_id`` is ``None`` — no trigger).
     """
     out: list[ParsedAutomation] = []
-    for domain, instance, comp_id, target in _iter_instance_targets(root):
+    for domain, instance, comp_id, target in iter_instance_targets(root):
         # The shared walk also yields sub-entities (for inline ``on_*``
         # parsing); skip them — a nested field, sub-entity blocks
         # included, is addressed on the *parent* instance via the dotted
@@ -740,6 +757,16 @@ def _is_list_form_trigger(body: Any, trigger: AutomationTrigger) -> bool:
     )
 
 
+def is_mapping_entry(item: Any) -> bool:
+    """Report whether *item* is a mapping-shaped list entry; a block's describe may skip it too."""
+    return isinstance(item, dict)
+
+
+def is_effect_item(item: Any) -> bool:
+    """Report whether *item* is an ``effects:`` entry the parser lists."""
+    return isinstance(item, dict) and len(item) == 1
+
+
 def is_trigger_entry(item: Any, trigger: AutomationTrigger) -> bool:
     """
     Report whether *item* looks like one entry of a list-shaped trigger.
@@ -812,7 +839,7 @@ def _parse_light_effects(root: Any) -> list[ParsedAutomation]:
         if not isinstance(effects, list):
             continue
         for idx, item in enumerate(effects):
-            if not isinstance(item, dict) or len(item) != 1:
+            if not is_effect_item(item):
                 continue
             effect_id = next(iter(item))
             params = item[effect_id] or {}

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +24,7 @@ from ..mac_addresses import derive_interface_macs
 from ..migrations import has_pending_migrations
 from ..storage_path import resolve_storage_path
 from ..validated_config_cache import find_validated_cache, parse_validated_cache
+from ._chip import resolve_chip_mcu
 from ._mqtt_block import build_mqtt_extract
 from ._parsing import (
     _CONF_ALLOW_PARTITION_ACCESS,
@@ -34,6 +35,7 @@ from ._parsing import (
     config_has_top_level_block,
     configuration_stem,
     detect_platform_from_yaml,
+    extract_component_ids,
     extract_config_content_fingerprint,
     extract_directly_referenced_integrations,
     extract_esphome_meta_from_config,
@@ -76,11 +78,11 @@ def load_device_from_storage(
     *,
     deployed_config_hash: str = "",
     deployed_version: str = "",
-    project_name: str = "",
-    project_version: str = "",
     network: str = "",
     queued_update: bool = False,
     api_encryption_active: str | None = None,
+    deployed_name: str = "",
+    offline_since: float | None = None,
     previous: Device | None = None,
     shallow: bool = False,
 ) -> Device:
@@ -204,11 +206,10 @@ def load_device_from_storage(
         else DeviceRuntimeState(
             deployed_config_hash=deployed_config_hash,
             deployed_version=deployed_version,
-            project_name=project_name,
-            project_version=project_version,
             network=network,
             api_encryption_active=api_encryption_active,
             queued_update=queued_update,
+            offline_since=offline_since,
         )
     )
 
@@ -271,6 +272,8 @@ def load_device_from_storage(
         extra_subs,
         storage_variant=storage.target_platform if storage else None,
     )
+
+    mcu = resolve_chip_mcu(resolved_config, yaml_content, target_platform, extra_subs)
 
     loaded_integrations = sorted(storage.loaded_integrations) if storage else []
     loaded_platforms = dotted_loaded_platforms(storage.loaded_platforms) if storage else []
@@ -358,12 +361,14 @@ def load_device_from_storage(
         address=(storage.address if storage and storage.address else f"{fallback_name}.local"),
         content_fingerprint=extract_config_content_fingerprint(yaml_content),
         ip=ip,
+        deployed_name=deployed_name,
         web_port=storage.web_port if storage else None,
         current_version=const.__version__,
         expected_config_hash=expected_config_hash,
         loaded_integrations=loaded_integrations,
         loaded_platforms=loaded_platforms,
         directly_referenced_integrations=directly_referenced_integrations,
+        component_ids=extract_component_ids(resolved_config),
         has_pending_changes=has_pending,
         pending_changes_via_hash=pending_via_hash,
         update_available=update_available,
@@ -388,6 +393,7 @@ def load_device_from_storage(
         labels=list(labels),
         logger_baud_rate=logger_baud_rate,
         logger_interface=logger_interface,
+        mcu=mcu,
         # Gates the install dialog's OTA bootloader-update action; esp32-only
         # (the esphome schema rejects the flag elsewhere). Union of two
         # signals: the in-process resolved YAML (immediate on edit) and the
@@ -400,6 +406,11 @@ def load_device_from_storage(
         and (
             extract_ota_partition_access(resolved_config)
             or compiled_config_has_ota_partition_access(filename)
+        ),
+        ota_signing_key=target_platform == "esp32"
+        and not shallow
+        and (
+            _has_ota_signing_key(resolved_config) or compiled_config_has_ota_signing_key(filename)
         ),
     )
 
@@ -598,6 +609,30 @@ def compiled_config_has_ota_partition_access(configuration: str) -> bool:
     config, materially larger than the source YAML, and this runs per
     device reload.
     """
+    return _compiled_config_matches(
+        configuration, _CONF_ALLOW_PARTITION_ACCESS, extract_ota_partition_access
+    )
+
+
+def compiled_config_has_ota_signing_key(configuration: str) -> bool:
+    """Report whether the last compile's validated-config cache sets an OTA ``signing_key``."""
+    return _compiled_config_matches(configuration, "signing_key", _has_ota_signing_key)
+
+
+def _has_ota_signing_key(config: dict | None) -> bool:
+    """Report whether the esp32 ``signed_ota_verification`` block sets ``signing_key``."""
+    node: object = config
+    for key in ("esp32", "framework", "advanced", "signed_ota_verification"):
+        if not isinstance(node, dict):
+            return False
+        node = node.get(key)
+    return isinstance(node, dict) and "signing_key" in node
+
+
+def _compiled_config_matches(
+    configuration: str, marker: str, predicate: Callable[[dict], bool]
+) -> bool:
+    """Apply *predicate* to the validated-config cache; skip the parse when *marker* is absent."""
     path = find_validated_cache(configuration)
     if path is None:
         return False
@@ -605,7 +640,7 @@ def compiled_config_has_ota_partition_access(configuration: str) -> bool:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    if _CONF_ALLOW_PARTITION_ACCESS not in text:
+    if marker not in text:
         return False
     config = parse_validated_cache(path, text)
-    return config is not None and extract_ota_partition_access(config)
+    return config is not None and predicate(config)

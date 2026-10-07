@@ -39,7 +39,12 @@ from .helpers import (
     _decode_mdns_txt_records,
     device_name_from_service,
 )
-from .interface_monitor import monitor_interfaces
+from .interface_monitor import (
+    ZeroconfBinding,
+    async_scan_host,
+    monitor_interfaces,
+    startup_bindings,
+)
 from .shared import _MDNS_HOSTNAME_RESOLVE_TIMEOUT, apply_resolved_addresses
 
 if TYPE_CHECKING:
@@ -82,28 +87,6 @@ _IDENTITY_TXT_APPLIERS: tuple[tuple[str, Callable[[DeviceStateMonitor, str, str]
     ("mac", lambda monitor, name, value: monitor.apply_mac_address(name, value)),
 )
 
-# Descriptive TXT key → ``(runtime_state field, callback selector)``.
-# Deliberately *not* part of ``_IDENTITY_TXT_APPLIERS``: these keys say
-# what firmware a device runs and how it is attached, never whether the
-# deployed identity is fresh. Folding them into the identity trio would
-# let a ``project_name``-only TXT stamp ``deployed_identity_live``,
-# which the verify-resolve loop reads as "identity vouched for" and
-# would then stop re-resolving on. Applied on both the
-# ``_esphomelib._tcp`` and ``_http._tcp`` paths — ESPHome publishes the
-# same descriptive set on whichever service the device has.
-#
-# A table of (key, field, selector) rather than three ``apply_*``
-# methods on the monitor: every entry is the same differ-gate-then-
-# forward, and the monitor's public surface is at its ``PLR0904``
-# ceiling.
-_DESCRIPTIVE_TXT_APPLIERS: tuple[
-    tuple[str, str, Callable[[DeviceStateMonitor], Callable[[str, str], None] | None]], ...
-] = (
-    ("project_name", "project_name", lambda monitor: monitor._on_project_name_change),
-    ("project_version", "project_version", lambda monitor: monitor._on_project_version_change),
-    ("network", "network", lambda monitor: monitor._on_network_change),
-)
-
 
 def _has_identity_keys(props: Mapping[str, str | None]) -> bool:
     """Whether *props* carries any identity TXT key with a value."""
@@ -137,11 +120,9 @@ class MdnsSource:
         return self._zeroconf
 
     async def start(self) -> None:
-        try:
-            self._zeroconf = AsyncEsphomeZeroconf()
-        except Exception:
-            _LOGGER.exception("Could not start zeroconf — falling back to ping only")
-            self._zeroconf = None
+        attempts = startup_bindings(await async_scan_host())
+        self._zeroconf, applied = self._create_zeroconf(attempts)
+        if self._zeroconf is None:
             return
 
         try:
@@ -162,7 +143,12 @@ class MdnsSource:
         # Docker churn) for the instance's lifetime; cancelled in close_zeroconf.
         if self._zeroconf is not None:
             self._interface_monitor_task = create_logged_task(
-                monitor_interfaces(self._zeroconf), name="Interface monitor"
+                monitor_interfaces(
+                    self._zeroconf,
+                    applied,
+                    None if applied is attempts[0] else IPVersion.V4Only,
+                ),
+                name="Interface monitor",
             )
 
     async def cancel_browser(self) -> None:
@@ -483,6 +469,27 @@ class MdnsSource:
             return
         self._monitor._track_task(self.resolve_then(zeroconf, info, device_name, applier))
 
+    def _create_zeroconf(
+        self, attempts: list[ZeroconfBinding]
+    ) -> tuple[AsyncEsphomeZeroconf | None, ZeroconfBinding | None]:
+        """Create the responder from the first of *attempts* that binds."""
+        for binding in attempts:
+            try:
+                zeroconf = AsyncEsphomeZeroconf(
+                    interfaces=binding.interfaces, ip_version=binding.ip_version
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Could not start zeroconf with %s", binding.ip_version, exc_info=True
+                )
+                continue
+            _LOGGER.info(
+                "mDNS responder started with %s on %s", binding.ip_version, binding.interfaces
+            )
+            return zeroconf, binding
+        _LOGGER.error("Could not start zeroconf — falling back to ping only")
+        return None, None
+
     def _on_esphomelib_service_state_change(
         self, zeroconf: Any, service_type: str, name: str, state_change: ServiceStateChange
     ) -> None:
@@ -584,10 +591,10 @@ class MdnsSource:
         self._apply_txt_properties(device_name, info.decoded_properties)
 
     def _apply_txt_properties(self, device_name: str, props: Mapping[str, str | None]) -> None:
-        """Apply identity, descriptive, and api_encryption keys from decoded TXT properties."""
+        """Apply identity, network, and api_encryption keys from decoded TXT properties."""
         monitor = self._monitor
         self._apply_identity_txt(device_name, props)
-        self._apply_descriptive_txt(device_name, props)
+        self._apply_network_txt(device_name, props)
         # api_encryption tri-state semantics on this announce:
         #
         # * Key present with truthy value: encryption confirmed
@@ -609,6 +616,8 @@ class MdnsSource:
             monitor.apply_api_encryption(device_name, value if isinstance(value, str) else "")
         elif props:
             monitor.apply_api_encryption(device_name, "")
+        if props:
+            monitor._apply_ota_signed(device_name, signed=props.get("ota_signed") == "1")
 
     def _apply_identity_txt(self, device_name: str, props: Mapping[str, str | None]) -> None:
         """Apply the version / config_hash / mac identity TXT keys, tolerating absence."""
@@ -617,14 +626,11 @@ class MdnsSource:
             if value := props.get(key):
                 apply(monitor, device_name, value)
 
-    def _apply_descriptive_txt(self, device_name: str, props: Mapping[str, str | None]) -> None:
-        """Apply the project_name / project_version / network TXT keys, tolerating absence."""
-        monitor = self._monitor
-        for key, field, select_forward in _DESCRIPTIVE_TXT_APPLIERS:
-            if value := props.get(key):
-                monitor._apply_descriptive_observation(
-                    device_name, field, value, select_forward(monitor)
-                )
+    def _apply_network_txt(self, device_name: str, props: Mapping[str, str | None]) -> None:
+        """Apply the ``network`` TXT key; absent or empty never blanks a known value."""
+        # Kept out of _IDENTITY_TXT_APPLIERS so it never stamps deployed_identity_live.
+        if network := props.get("network"):
+            self._monitor._apply_network(device_name, network)
 
     def _on_http_service_state_change(
         self, zeroconf: Any, service_type: str, name: str, state_change: ServiceStateChange
@@ -679,7 +685,7 @@ class MdnsSource:
     def _apply_http_identity_props(self, device_name: str, props: Mapping[str, str | None]) -> None:
         """Apply ``_http._tcp`` identity keys and stamp freshness when any are present."""
         self._apply_identity_txt(device_name, props)
-        self._apply_descriptive_txt(device_name, props)
+        self._apply_network_txt(device_name, props)
         if _has_identity_keys(props):
             self._monitor.apply_deployed_identity_live(device_name, live=True)
 

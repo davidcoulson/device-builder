@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -65,12 +65,19 @@ from .conftest import (
 )
 
 
-def _device(name: str, *, ip: str = "", ip_addresses: list[str] | None = None) -> Device:
+def _device(
+    name: str,
+    *,
+    ip: str = "",
+    ip_addresses: list[str] | None = None,
+    loaded_integrations: list[str] | None = None,
+) -> Device:
     return make_device(
         name=name,
         state=DeviceState.ONLINE,
         ip=ip,
         ip_addresses=list(ip_addresses) if ip_addresses else [],
+        loaded_integrations=loaded_integrations or [],
     )
 
 
@@ -771,8 +778,8 @@ async def test_add_component_with_draft_merges_draft_and_skips_persist(
         "esphome_device_builder.controllers.devices.add_component.merge_component_yaml",
         lambda existing, component, fields: f"{existing}# added\n",
     )
-    persist = AsyncMock()
-    monkeypatch.setattr(controller, "_persist_yaml_mutation", persist)
+    rewrite = AsyncMock()
+    monkeypatch.setattr(controller, "rewrite_yaml", rewrite)
     (tmp_path / "kitchen.yaml").write_text("DISK\n", encoding="utf-8")
 
     resp = await controller.add_component(
@@ -783,7 +790,7 @@ async def test_add_component_with_draft_merges_draft_and_skips_persist(
     )
 
     assert resp.yaml == "DRAFT\n# added\n"
-    persist.assert_not_awaited()
+    rewrite.assert_not_awaited()
     assert (tmp_path / "kitchen.yaml").read_text(encoding="utf-8") == "DISK\n"
 
 
@@ -799,8 +806,7 @@ async def test_add_component_without_draft_reads_disk_and_persists(
         "esphome_device_builder.controllers.devices.add_component.merge_component_yaml",
         lambda existing, component, fields: f"{existing}# added\n",
     )
-    persist = AsyncMock()
-    monkeypatch.setattr(controller, "_persist_yaml_mutation", persist)
+    monkeypatch.setattr(controller, "_schedule_storage_regenerate", lambda _configuration: None)
     (tmp_path / "kitchen.yaml").write_text("DISK\n", encoding="utf-8")
 
     resp = await controller.add_component(
@@ -810,7 +816,50 @@ async def test_add_component_without_draft_reads_disk_and_persists(
     )
 
     assert resp.yaml == "DISK\n# added\n"
-    persist.assert_awaited_once_with("kitchen.yaml", "DISK\n# added\n", message=ANY)
+    assert (tmp_path / "kitchen.yaml").read_text(encoding="utf-8") == "DISK\n# added\n"
+
+
+async def test_add_component_to_a_missing_config_is_not_found(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    controller = make_controller(tmp_path)
+    _stub_components(controller)
+
+    with pytest.raises(CommandError) as err:
+        await controller.add_component(configuration="ghost.yaml", component_id="i2c", fields={})
+
+    assert err.value.code == ErrorCode.NOT_FOUND
+    assert not (tmp_path / "ghost.yaml").exists()
+
+
+async def test_add_component_refuses_when_the_file_changed_during_the_merge(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = make_controller(tmp_path)
+    _stub_components(controller)
+    monkeypatch.setattr(controller, "_schedule_storage_regenerate", lambda _configuration: None)
+    path = tmp_path / "kitchen.yaml"
+    path.write_text("DISK\n", encoding="utf-8")
+
+    real_persist = add_component_mod.persist_if_unchanged
+
+    async def _a_save_lands_first(*args: Any, **kwargs: Any) -> None:
+        await controller.update_config(configuration="kitchen.yaml", content="SAVED MEANWHILE\n")
+        await real_persist(*args, **kwargs)
+
+    monkeypatch.setattr(add_component_mod, "persist_if_unchanged", _a_save_lands_first)
+    monkeypatch.setattr(
+        "esphome_device_builder.controllers.devices.add_component.merge_component_yaml",
+        lambda existing, component, fields: f"{existing}# added\n",
+    )
+
+    with pytest.raises(CommandError) as err:
+        await controller.add_component(configuration="kitchen.yaml", component_id="i2c", fields={})
+
+    assert err.value.code == ErrorCode.PRECONDITION_FAILED
+    assert path.read_text(encoding="utf-8") == "SAVED MEANWHILE\n"
 
 
 async def test_add_component_into_broken_draft_appends_through_real_merge(
@@ -825,8 +874,8 @@ async def test_add_component_into_broken_draft_appends_through_real_merge(
     )
     controller._db.components = MagicMock()
     controller._db.components.get_component = AsyncMock(return_value=component)
-    persist = AsyncMock()
-    monkeypatch.setattr(controller, "_persist_yaml_mutation", persist)
+    rewrite = AsyncMock()
+    monkeypatch.setattr(controller, "rewrite_yaml", rewrite)
 
     broken = 'esphome:\n  name: "kitch\nsensor:\n  - platform:\n'
     resp = await controller.add_component(
@@ -838,7 +887,8 @@ async def test_add_component_into_broken_draft_appends_through_real_merge(
 
     assert broken in resp.yaml
     assert "i2c:\n  sda: GPIO21\n  scl: GPIO22\n" in resp.yaml
-    persist.assert_not_awaited()
+    rewrite.assert_not_awaited()
+    assert not (tmp_path / "kitchen.yaml").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1512,19 +1562,48 @@ def _adoptable(name: str) -> AdoptableDevice:
     )
 
 
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_register_new_device_logs_a_failed_scan(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A scan I/O failure after the write is logged, not raised: the file is on disk either way."""
+    controller = make_controller(tmp_path, with_state_monitor=True)
+    controller._scanner.scan = AsyncMock(side_effect=OSError("scan broke"))
+
+    await controller._register_new_device("kitchen.yaml", "Create kitchen.yaml")
+
+    assert "Scan after writing kitchen.yaml failed" in caplog.text
+
+
+@pytest.mark.usefixtures("stub_create_device_metadata_helpers")
+async def test_register_new_device_propagates_a_scan_bug(
+    tmp_path: Path,
+    make_controller: MakeControllerFactory,
+) -> None:
+    """Only I/O is tolerated after the write; a bug in the scan still surfaces."""
+    controller = make_controller(tmp_path, with_state_monitor=True)
+    controller._scanner.scan = AsyncMock(side_effect=RuntimeError("scan bug"))
+
+    with pytest.raises(RuntimeError, match="scan bug"):
+        await controller._register_new_device("kitchen.yaml", "Create kitchen.yaml")
+
+
 def test_on_scan_change_added_prunes_stale_importable_row(
     tmp_path: Path,
     make_controller: MakeControllerFactory,
     capture_devices_events: CaptureDevicesEventsFactory,
 ) -> None:
-    """A discovered device becoming configured drops its importable row and fires REMOVED."""
+    """A discovered device becoming configured drops only its own importable row."""
     controller = make_controller(tmp_path, with_state_monitor=True)
     controller.state.import_result["kitchen"] = _adoptable("kitchen")
+    controller.state.import_result["kitchen-2"] = _adoptable("kitchen-2")
     captured = capture_devices_events(controller, EventType.IMPORTABLE_DEVICE_REMOVED)
 
     controller._on_scan_change(ScanChange.ADDED, _device("kitchen"))
 
-    assert "kitchen" not in controller.state.import_result
+    assert list(controller.state.import_result) == ["kitchen-2"]
     assert [e.data["name"] for e in captured] == ["kitchen"]
 
 
@@ -1542,7 +1621,7 @@ def test_on_scan_change_added_without_importable_row_is_silent(
     assert captured == []
 
 
-def test_on_scan_change_reloaded_name_change_prunes_importable_row(
+async def test_on_scan_change_reloaded_name_change_prunes_importable_row(
     tmp_path: Path,
     make_controller: MakeControllerFactory,
     capture_devices_events: CaptureDevicesEventsFactory,
@@ -1559,7 +1638,7 @@ def test_on_scan_change_reloaded_name_change_prunes_importable_row(
     assert ("revisit_importable", "kitchen-yaml") in controller._state_monitor.calls
 
 
-def test_on_scan_change_updated_name_change_prunes_importable_row(
+async def test_on_scan_change_updated_name_change_prunes_importable_row(
     tmp_path: Path,
     make_controller: MakeControllerFactory,
     capture_devices_events: CaptureDevicesEventsFactory,
@@ -1574,6 +1653,45 @@ def test_on_scan_change_updated_name_change_prunes_importable_row(
     assert "kitchen" not in controller.state.import_result
     assert [e.data["name"] for e in captured] == ["kitchen"]
     assert ("revisit_importable", "old-kitchen") in controller._state_monitor.calls
+
+
+async def test_on_scan_change_name_change_records_the_deployed_name(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """A hand-edited ``esphome.name`` strands the firmware like a config-only rename."""
+    controller = make_controller(tmp_path, with_state_monitor=True)
+
+    compiled = _device("livingroom", loaded_integrations=["api"])
+    # The scanner indexes the row before it notifies; the stamp must reach it.
+    controller._scanner.devices = [compiled]
+
+    controller._on_scan_change(ScanChange.UPDATED, compiled, _device("kitchen"))
+
+    assert controller._metadata_store.get(compiled.configuration)["deployed_name"] == "kitchen"
+    assert compiled.deployed_name == "kitchen"
+
+
+async def test_on_scan_change_unbuilt_name_change_records_nothing(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """The cold-start refine renames off a placeholder; no build output backs it."""
+    controller = make_controller(tmp_path, with_state_monitor=True)
+    refined = _device("livingroom")
+
+    controller._on_scan_change(ScanChange.RELOADED, refined, _device("livingroom-yaml"))
+
+    assert controller._metadata_store.get(refined.configuration) == {}
+
+
+async def test_on_scan_change_same_name_records_nothing(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    """An ordinary edit leaves no record; the firmware still matches the YAML."""
+    controller = make_controller(tmp_path, with_state_monitor=True)
+
+    controller._on_scan_change(ScanChange.UPDATED, _device("kitchen"), _device("kitchen"))
+
+    assert controller._metadata_store.get(_device("kitchen").configuration) == {}
 
 
 def test_on_scan_change_reloaded_same_name_skips_importable_prune(
@@ -1593,7 +1711,7 @@ def test_on_scan_change_reloaded_same_name_skips_importable_prune(
     assert ("revisit_importable", "kitchen") not in controller._state_monitor.calls
 
 
-def test_on_scan_change_rename_migrates_monitor_state(
+async def test_on_scan_change_rename_migrates_monitor_state(
     tmp_path: Path, make_controller: MakeControllerFactory
 ) -> None:
     """A rename probes the corrected name and forgets the freed name's monitor state."""
@@ -1607,7 +1725,7 @@ def test_on_scan_change_rename_migrates_monitor_state(
     assert "old-kitchen" not in controller._reachability._ping_last_seen
 
 
-def test_on_scan_change_rename_keeps_state_for_surviving_sibling(
+async def test_on_scan_change_rename_keeps_state_for_surviving_sibling(
     tmp_path: Path, make_controller: MakeControllerFactory
 ) -> None:
     """The freed name's monitor state survives while a sibling YAML still owns it."""

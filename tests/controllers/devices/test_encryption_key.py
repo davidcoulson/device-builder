@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,7 +20,7 @@ from esphome_device_builder.helpers.storage import drain_shutdown_callbacks
 from esphome_device_builder.models import ErrorCode
 from tests.conftest import make_device
 
-from .conftest import ESPHOME_CONFIG_STUB_TARGET, MakeControllerFactory
+from .conftest import ESPHOME_CONFIG_STUB_TARGET, VALIDATOR_OUTAGES, MakeControllerFactory
 
 KEY = base64.b64encode(b"k" * 32).decode()
 OTHER_KEY = base64.b64encode(b"j" * 32).decode()
@@ -69,6 +71,44 @@ async def test_set_encryption_key_overwrites_existing_literal(
     assert ("request", "kitchen.yaml") in ctrl._scanner.calls
 
 
+async def test_set_encryption_key_keeps_the_key_when_the_file_changed_during_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_controller: MakeControllerFactory
+) -> None:
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _configure(ctrl, tmp_path, API_KEY_YAML)
+    concurrent = API_KEY_YAML + "logger:\n"
+
+    async def _save_lands_meanwhile(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        await ctrl.update_config(configuration="kitchen.yaml", content=concurrent)
+        return SimpleNamespace(unavailable=False)
+
+    monkeypatch.setattr(ctrl, "_validate_rewritten_yaml_or_raise", _save_lands_meanwhile)
+
+    result = await ctrl.set_encryption_key(name="kitchen", key=KEY)
+
+    assert result["result"] == "not_writable"
+    assert "differs from the expected text" in result["reason"]
+    assert "\n" not in result["reason"]
+    assert ":;" not in result["reason"]
+    assert result["reason"].endswith("the key was kept for a later attempt")
+    assert (tmp_path / "kitchen.yaml").read_text(encoding="utf-8") == concurrent
+    assert ctrl._pending_keys.get("kitchen") == {"key": KEY}
+
+
+async def test_set_encryption_key_keeps_the_key_when_the_config_vanished(
+    tmp_path: Path, make_controller: MakeControllerFactory
+) -> None:
+    ctrl = make_controller(tmp_path, with_state_monitor=True)
+    _configure(ctrl, tmp_path, API_KEY_YAML)
+    await asyncio.to_thread((tmp_path / "kitchen.yaml").unlink)
+
+    result = await ctrl.set_encryption_key(name="kitchen", key=KEY)
+
+    assert result["result"] == "not_writable"
+    assert result["reason"] == "Device 'kitchen.yaml' not found"
+    assert ctrl._pending_keys.get("kitchen") == {"key": KEY}
+
+
 async def test_set_encryption_key_same_key_is_unchanged_no_write(
     tmp_path: Path,
     make_controller: MakeControllerFactory,
@@ -98,8 +138,7 @@ async def test_set_encryption_key_inserts_block_for_package_provided_api(
 
     assert result["result"] == "updated"
     new_yaml = (tmp_path / "kitchen.yaml").read_text(encoding="utf-8")
-    assert new_yaml.startswith(f'api:\n  encryption:\n    key: "{KEY}"\n')
-    assert yaml_text in new_yaml
+    assert new_yaml == f'{yaml_text}\napi:\n  encryption:\n    key: "{KEY}"\n'
 
 
 async def test_set_encryption_key_refuses_resolved_apiless_configuration(
@@ -455,6 +494,9 @@ async def test_set_encryption_key_partial_refusal_keeps_reason(
 
     assert result["result"] == "updated"
     assert "!secret" in result["reason"]
+    # The sibling's update consumed the key, so the refusal must not claim it was kept.
+    assert "kept for a later attempt" not in result["reason"]
+    assert ctrl._pending_keys.get("kitchen") is None
 
 
 async def test_set_encryption_key_stores_pending_for_unadopted_device(
@@ -639,19 +681,21 @@ async def test_set_encryption_key_unresolvable_config_keeps_key(
         resolve.assert_not_awaited()
 
 
-async def test_set_encryption_key_validator_timeout_is_typed_and_keeps_key(
+@pytest.mark.parametrize("exc", VALIDATOR_OUTAGES)
+async def test_set_encryption_key_validator_outage_is_typed_and_keeps_key(
     tmp_path: Path,
     make_controller: MakeControllerFactory,
+    exc: Exception,
 ) -> None:
-    """A validator timeout refuses cleanly instead of escaping as a 500."""
+    """A validator outage refuses cleanly instead of escaping as a 500."""
     ctrl = make_controller(tmp_path, with_state_monitor=True)
     _configure(ctrl, tmp_path, API_KEY_YAML)
-    ctrl._db.editor.validate_yaml = AsyncMock(side_effect=TimeoutError())
+    ctrl._db.editor.validate_yaml = AsyncMock(side_effect=exc)
 
     result = await ctrl.set_encryption_key(name="kitchen", key=KEY)
 
     assert result["result"] == "not_writable"
-    assert "validated in time" in result["reason"]
+    assert "validator was unavailable" in result["reason"]
     assert OTHER_KEY in (tmp_path / "kitchen.yaml").read_text(encoding="utf-8")
     assert ctrl._pending_keys.get("kitchen") == {"key": KEY}
 

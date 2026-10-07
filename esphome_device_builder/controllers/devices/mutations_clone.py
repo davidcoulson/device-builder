@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from ...helpers.api import CommandError
 from ...helpers.async_ import run_in_executor
+from ...helpers.device_config import read_device_config
 from ...helpers.device_yaml import (
     configuration_stem,
     parse_esphome_meta,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
     from .controller import DevicesController
 
 
-async def clone_device(  # noqa: C901
+async def clone_device(
     controller: DevicesController,
     *,
     configuration: str,
@@ -80,21 +81,13 @@ async def clone_device(  # noqa: C901
     # Source YAML read on the executor; shared-sidecar read goes
     # through the client's sync path inside the same hop so the
     # identity carry-forward piggy-backs.
-    def _gather() -> tuple[str | None, dict[str, Any], bool]:
+    def _gather() -> tuple[str, dict[str, Any]]:
         if new_path.exists():
-            return None, {}, True
-        if not source_path.exists():
-            return None, {}, False
-        content = source_path.read_text(encoding="utf-8")
-        meta = controller._shared_sidecar.get_sync(configuration)
-        return content, meta, False
+            raise_device_name_exists(new_filename)
+        content = read_device_config(source_path, configuration)
+        return content, controller._shared_sidecar.get_sync(configuration)
 
-    source_content, source_meta, target_existed = await run_in_executor(_gather)
-    if target_existed:
-        raise_device_name_exists(new_filename)
-    if source_content is None:
-        msg = f"Source device {configuration} not found"
-        raise CommandError(ErrorCode.INVALID_ARGS, msg)
+    source_content, source_meta = await run_in_executor(_gather)
 
     # Validate the source before rewrite work; the leaf rewrites are
     # structure-preserving or refuse (see rewrite_api_encryption_key), so a
@@ -162,8 +155,11 @@ async def clone_device(  # noqa: C901
     # mis-route ``devices/logs`` until the first mDNS announce.
     # StorageJSON is skipped entirely since it's a build artefact and
     # the next compile writes a real one.
-    carry_board_id = source_meta.get("board_id") if source_meta else None
-    carry_user_set = source_meta.get("board_id_user_set") if source_meta else None
+    carry_board_id = (
+        source_meta.get("board_id")
+        if source_meta and source_meta.get("board_id_user_set") is True
+        else None
+    )
 
     def _raise_name_exists(exc: BaseException) -> NoReturn:
         # Race: another caller created the file between our
@@ -173,13 +169,9 @@ async def clone_device(  # noqa: C901
         raise_device_name_exists(new_filename, from_exc=exc)
 
     await write_new_file_exclusive(new_path, new_content, on_exists=_raise_name_exists)
-    if carry_board_id and carry_user_set is True:
-        await controller._persist_device_metadata_async(
-            new_filename, board_id=carry_board_id, board_id_user_set=True
-        )
-    await controller._commit_history(new_filename, f"Clone {configuration} to {new_filename}")
-    # Rescan so the scanner indexes the new YAML and fires the
-    # ADDED event WS subscribers expect; ``probe_device`` runs
-    # from the scan-change handler so no double-probe here.
-    await controller._scanner.scan()
+    await controller._register_new_device(
+        new_filename,
+        f"Clone {configuration} to {new_filename}",
+        board_id=carry_board_id,
+    )
     return {"configuration": new_filename}

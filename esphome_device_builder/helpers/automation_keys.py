@@ -1,6 +1,8 @@
-"""Shared classifier for inline automation trigger keys."""
+"""Shared classifiers for automation body keys."""
 
 from __future__ import annotations
+
+from ..models.automations import AutomationAction, AutomationCondition
 
 # Key-name prefixes marking an inline automation *trigger* (``on_press``,
 # ``on_value``, ``on_state_change``, ...). A ``type: trigger`` config-var
@@ -8,6 +10,17 @@ from __future__ import annotations
 # ``open_action``, ``*_mode``) the component performs on command — edited
 # through the component form's action-list surface, not the trigger picker.
 TRIGGER_KEY_PREFIXES: tuple[str, ...] = ("on_",)
+
+# Action-body keys that introduce a condition gate rather than plain params.
+CONDITION_GATE_KEYS: frozenset[str] = frozenset({"condition", "all", "any"})
+
+# Fallback collapse key for an entry with no usable scalar shorthand.
+DEFAULT_SHORTHAND_KEY = "id"
+
+# Keys of a time period's mapping form (esphome ``cv.time_period_dict``).
+DURATION_UNIT_KEYS: frozenset[str] = frozenset(
+    {"days", "hours", "minutes", "seconds", "milliseconds", "microseconds"}
+)
 
 
 def is_trigger_key(key: str) -> bool:
@@ -18,3 +31,26 @@ def is_trigger_key(key: str) -> bool:
 def bare_trigger_key(trigger_id: str) -> str:
     """Return the ``on_*`` YAML key a catalog trigger id ends in."""
     return trigger_id.rsplit(".", 1)[-1]
+
+
+def shorthand_key(entry: AutomationAction | AutomationCondition | None) -> str | None:
+    """Return the key a bare scalar collapses to, ``None`` when the entry has no scalar form."""
+    if entry is None:
+        return None
+    action_lists = entry.accepts_action_list if isinstance(entry, AutomationAction) else ()
+    key = entry.scalar_shorthand_key
+    if key and key not in CONDITION_GATE_KEYS and key not in action_lists:
+        return key
+    if any(e.key == DEFAULT_SHORTHAND_KEY for e in entry.config_entries):
+        return None
+    return DEFAULT_SHORTHAND_KEY
+
+
+def scalar_param_key(entry: AutomationAction | AutomationCondition) -> str:
+    """Return the param key a parsed bare scalar is stored under."""
+    return shorthand_key(entry) or DEFAULT_SHORTHAND_KEY
+
+
+def is_scalar_bodied(entry: AutomationAction | AutomationCondition) -> bool:
+    """Whether *entry*'s whole body is one value (``delay: 2s``), not a mapping of fields."""
+    return entry.value_type is not None and not entry.config_entries

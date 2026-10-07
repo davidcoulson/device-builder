@@ -100,16 +100,15 @@ ApiEncryptionChangeCallback = Callable[[str, str], None]
 # firmware without the broadcast doesn't blank a known MAC.
 MacAddressChangeCallback = Callable[[str, str], None]
 
-# mDNS ``project_name`` / ``project_version`` TXT change — the
-# ``esphome: project:`` pair stamped into a distributor's firmware.
-# Descriptive only: they never gate an update or pending-changes
-# verdict, and never vouch for identity freshness.
-ProjectNameChangeCallback = Callable[[str, str], None]
-ProjectVersionChangeCallback = Callable[[str, str], None]
-
 # mDNS ``network`` TXT change — ``"wifi"`` / ``"ethernet"``, the link
-# the announce actually arrived over. Absent on pre-2023.6 firmware.
+# the announce arrived over. Descriptive only: it never vouches for
+# identity freshness. Absent on pre-2023.6 firmware.
 NetworkChangeCallback = Callable[[str, str], None]
+
+
+# mDNS ``ota_signed`` TXT change; False once an announce omits the key.
+class OtaSignedChangeCallback(Protocol):
+    def __call__(self, name: str, *, signed: bool) -> None: ...
 
 
 # Deployed-identity freshness: True when first-party evidence was just
@@ -168,8 +167,6 @@ class DeviceStateMonitor(TaskControllerBase):
         on_config_hash_change: ConfigHashChangeCallback | None = None,
         on_api_encryption_change: ApiEncryptionChangeCallback | None = None,
         on_mac_address_change: MacAddressChangeCallback | None = None,
-        on_project_name_change: ProjectNameChangeCallback | None = None,
-        on_project_version_change: ProjectVersionChangeCallback | None = None,
         on_network_change: NetworkChangeCallback | None = None,
         on_importable_added: ImportableAddedCallback | None = None,
         on_importable_removed: ImportableRemovedCallback | None = None,
@@ -182,6 +179,7 @@ class DeviceStateMonitor(TaskControllerBase):
         on_persisted_ip_invalidated: PersistedIpInvalidatedCallback | None = None,
         on_resolved_addresses_cleared: ResolvedAddressesClearedCallback | None = None,
         on_deployed_identity_live_change: DeployedIdentityLiveCallback | None = None,
+        on_ota_signed_change: OtaSignedChangeCallback | None = None,
     ) -> None:
         super().__init__()
         self._get_devices = get_devices
@@ -201,16 +199,7 @@ class DeviceStateMonitor(TaskControllerBase):
         self._on_config_hash_change = on_config_hash_change
         self._on_api_encryption_change = on_api_encryption_change
         self._on_mac_address_change = on_mac_address_change
-        # Explicitly annotated, unlike their siblings above: the
-        # descriptive applier table in ``mdns`` reads these attributes
-        # directly (rather than calling a method), and mypy can't infer
-        # an attribute's type through that module's TYPE_CHECKING-only
-        # import of this class.
-        self._on_project_name_change: ProjectNameChangeCallback | None = on_project_name_change
-        self._on_project_version_change: ProjectVersionChangeCallback | None = (
-            on_project_version_change
-        )
-        self._on_network_change: NetworkChangeCallback | None = on_network_change
+        self._on_network_change = on_network_change
         self._on_importable_added = on_importable_added
         self._on_importable_removed = on_importable_removed
         self._is_ignored = is_ignored or (lambda _name: False)
@@ -218,6 +207,7 @@ class DeviceStateMonitor(TaskControllerBase):
         self._on_persisted_ip_invalidated = on_persisted_ip_invalidated
         self._on_resolved_addresses_cleared = on_resolved_addresses_cleared
         self._on_deployed_identity_live_change = on_deployed_identity_live_change
+        self._on_ota_signed_change = on_ota_signed_change
         self.state = MonitorState(reachability=reachability)
         self._ping_task: asyncio.Task | None = None
         self._api_info_task: asyncio.Task | None = None
@@ -561,28 +551,11 @@ class DeviceStateMonitor(TaskControllerBase):
             return False
         return self._apply_observation(name, "mac_address", normalized, forward, name, normalized)
 
-    def _apply_descriptive_observation(
-        self, name: str, field: str, value: str, forward: Callable[[str, str], None] | None
-    ) -> bool:
-        """
-        Differ-gate one descriptive TXT observation; True iff forwarded.
-
-        One private entry point for ``project_name`` /
-        ``project_version`` / ``network`` rather than three public
-        ``apply_*`` sisters of :meth:`apply_version`: these keys carry
-        no verdict of their own, so the whole family is a field name
-        plus a callback, and the monitor's public surface is already
-        at the ceiling the ``PLR0904`` cap sets for it.
-
-        Empty values are dropped by the caller
-        (:meth:`MdnsSource._apply_descriptive_txt`) — firmware that
-        declares no project, or pre-2023.6 firmware with no
-        ``network`` key, publishes nothing, and an absent key must
-        never blank an already-known value.
-        """
-        if forward is None:
+    def _apply_network(self, name: str, network: str) -> bool:
+        """Differ-gate a non-empty ``network`` TXT observation; True iff forwarded."""
+        if (forward := self._on_network_change) is None:
             return False
-        return self._apply_observation(name, field, value, forward, name, value)
+        return self._apply_observation(name, "network", network, forward, name, network)
 
     def apply_deployed_identity_live(self, name: str, *, live: bool) -> bool:
         """
@@ -636,6 +609,12 @@ class DeviceStateMonitor(TaskControllerBase):
         return self.priority_for(name) is ReachabilitySource.MDNS and any(
             device.api_enabled for device in self._get_devices_by_name(name)
         )
+
+    def _apply_ota_signed(self, name: str, *, signed: bool) -> bool:
+        """Record whether the running firmware broadcasts ``ota_signed``; True iff forwarded."""
+        if (forward := self._on_ota_signed_change) is None:
+            return False
+        return self._apply_observation(name, "ota_signed", signed, forward, name, signed=signed)
 
     def _apply_observation[**P](
         self,

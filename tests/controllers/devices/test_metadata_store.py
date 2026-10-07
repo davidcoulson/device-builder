@@ -610,10 +610,11 @@ def test_store_fields_pinned() -> None:
         frozenset(
             {
                 "ip",
+                "offline_since",
+                "last_seen",
                 "deployed_config_hash",
                 "deployed_version",
-                "project_name",
-                "project_version",
+                "deployed_name",
                 "network",
                 "queued_update",
                 "api_encryption_active",
