@@ -237,7 +237,7 @@ def on_api_encryption_change(controller: DevicesController, name: str, encryptio
 
 
 def on_network_change(controller: DevicesController, name: str, network: str) -> None:
-    """Apply the link (``wifi`` / ``ethernet``) the device announced over."""
+    """Apply the link (``wifi`` / ``ethernet`` / ``thread``) the device announced over."""
     _apply_logged_observation(controller, name, "network", network, log_label="network")
 
 
